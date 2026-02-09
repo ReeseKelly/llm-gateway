@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+httpx[socks]
+httpx-socks
+python-dotenv
