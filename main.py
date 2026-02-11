@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -13,70 +14,10 @@ from config import Settings, get_settings
 
 app = FastAPI()
 
-def append_chat_log(
-    settings,
-    *,
-    request: Request,
-    payload: dict[str, Any],
-    raw_response: dict[str, Any],
-) -> None:
-    """
-    追加一行到 logs/chat_log.jsonl（JSON Lines 格式）。
-
-    - 不要求一定有 session_id/logical_session_id，有就记下，没有就写成 null。
-    - 即使失败也不要让整个接口崩掉，用 print 打一行 debug 就好。
-    """
-    try:
-        # 1. 决定 log 文件路径：<log_dir>/chat_log.jsonl
-        log_dir = Path(settings.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "chat_log.jsonl"
-
-        # 2. 从 header / payload 提取 session 信息（如果有的话）
-        headers = request.headers
-        session_id = headers.get("x-session-id") or payload.get("session_id")
-        logical_session_id = headers.get("x-logical-session-id") or payload.get(
-            "logical_session_id"
-        )
-
-        # 3. 从请求里拿 model / messages
-        model = payload.get("model", "")
-        request_messages = payload.get("messages", [])
-
-        # 4. 从 OpenRouter 返回里拿 assistant 的回复
-        reply_message: dict[str, Any] | None = None
-        try:
-            choices = raw_response.get("choices") or []
-            if choices:
-                reply_message = choices[0].get("message")
-        except Exception:
-            reply_message = None
-
-        # 兜底：万一没有标准结构，就把整个 response 塞进去，至少不丢东西
-        if not isinstance(reply_message, dict):
-            reply_message = {
-                "role": "assistant",
-                "content": json.dumps(raw_response, ensure_ascii=False),
-            }
-
-        # 5. 组装一条日志记录
-        entry: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "session_id": session_id,
-            "logical_session_id": logical_session_id,
-            "model": model,
-            "request_messages": request_messages,
-            "reply_message": reply_message,
-        }
-
-        # 6. 以 JSONL 形式追加写入
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-        print(f"DEBUG appended chat log to {log_path}")
-    except Exception as exc:
-        # 不要影响主流程，只打印一下
-        print(f"DEBUG failed to append chat log: {exc!r}")
+MAX_RECENT_RECORDS = 5
+MAX_RECENT_TEXT_CHARS = 200
+MIN_RECORDS_FOR_SUMMARY = 4
+UPDATE_EVERY_RECORDS = 5
 
 SUMMARY_SYSTEM_PROMPT = """You are a summarization model that maintains a rolling memory for a long-running, high-context conversation between a single user and an assistant.
 
@@ -173,6 +114,101 @@ def load_session_records(settings: Settings, logical_session_id: str) -> list[di
     return records
 
 
+def load_session_summary(
+    settings: Settings, logical_session_id: str
+) -> dict[str, Any] | None:
+    """
+    从 logs/session_summaries.json 读取指定 logical_session_id 的摘要。
+    - 文件路径: settings.log_dir / "session_summaries.json"
+    - 文件内容是一个 dict，顶层 key 是 logical_session_id
+    - 如果文件不存在，返回 None
+    - 如果没有这个 logical_session_id，返回 None
+    - 解析失败时打印一行 debug 并返回 None
+    """
+    path = Path(settings.log_dir) / "session_summaries.json"
+    if not path.exists():
+        return None
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"DEBUG failed to load session summary: {exc!r}")
+        return None
+
+    if not isinstance(data, dict):
+        print("DEBUG session_summaries has non-dict root, ignoring")
+        return None
+
+    summary_obj = data.get(logical_session_id)
+    if not summary_obj:
+        return None
+
+    if isinstance(summary_obj, dict):
+        return summary_obj
+    return None
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    return text[:max_chars]
+
+
+def build_messages_with_memory(
+    settings: Settings,
+    logical_session_id: str,
+    original_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    summary_obj = load_session_summary(settings, logical_session_id)
+    summary_text = None
+    if summary_obj:
+        summary_text = summary_obj.get("summary") if isinstance(summary_obj, dict) else None
+
+    records = load_session_records(settings, logical_session_id)
+    recent_records = records[-MAX_RECENT_RECORDS:] if records else []
+
+    recent_pairs: list[str] = []
+    for idx, record in enumerate(recent_records, start=1):
+        request_messages = record.get("request_messages", [])
+        user_text = ""
+        if isinstance(request_messages, list):
+            for msg in reversed(request_messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    user_text = msg.get("content", "")
+                    break
+        assistant_text = ""
+        reply_message = record.get("reply_message")
+        if isinstance(reply_message, dict):
+            assistant_text = reply_message.get("content", "")
+
+        user_text = _truncate_text(str(user_text), MAX_RECENT_TEXT_CHARS)
+        assistant_text = _truncate_text(str(assistant_text), MAX_RECENT_TEXT_CHARS)
+
+        recent_pairs.append(
+            f"[{idx}] User: {user_text}\n    Assistant: {assistant_text}"
+        )
+
+    recent_pairs_text = "\n".join(recent_pairs).strip()
+
+    memory_chunks: list[str] = []
+    if summary_text:
+        memory_chunks.append(
+            "Summary of previous interactions for this logical session:\n"
+            + summary_text
+        )
+    if recent_pairs_text:
+        memory_chunks.append("Recent exchanges (truncated):\n" + recent_pairs_text)
+
+    if not memory_chunks:
+        return original_messages
+
+    memory_system_message = {
+        "role": "system",
+        "content": "\n\n".join(memory_chunks),
+    }
+    return [memory_system_message] + original_messages
+
+
 def build_recent_messages_for_session(
     settings: Settings,
     logical_session_id: str,
@@ -206,6 +242,26 @@ def build_recent_messages_for_session(
             messages.append(reply_message)
 
     return messages
+
+
+def append_chat_log(
+    settings: Settings,
+    logical_session_id: str,
+    request_messages: list[dict[str, Any]],
+    reply_message: dict[str, Any],
+) -> None:
+    path = get_chat_log_path(settings)
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "logical_session_id": logical_session_id,
+        "request_messages": request_messages,
+        "reply_message": reply_message,
+    }
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"DEBUG failed to append chat log: {exc!r}")
 
 
 def get_summary_store_path(settings: Settings) -> Path:
@@ -264,13 +320,15 @@ def save_session_summary(
         print(f"DEBUG failed to save session summary: {exc!r}")
 
 
-async def generate_session_summary(
+async def run_session_summarization(
     settings: Settings, logical_session_id: str
 ) -> dict[str, Any]:
     """
-    为指定 logical_session_id 生成或更新滚动摘要。
+    对指定 logical_session_id 跑一次 summarization，
+    更新 session_summaries.json，并返回本次 summary 对象。
     """
     records = load_session_records(settings, logical_session_id)
+    total_records = len(records)
     if not records:
         return {"status": "no_records", "detail": "No records for this session."}
 
@@ -392,11 +450,54 @@ async def generate_session_summary(
 
     timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    return {
+    result = {
         "timestamp": timestamp,
         "status": "ok",
         **summary_core,
+        "total_records": total_records,
     }
+    save_session_summary(settings, logical_session_id, result)
+    return result
+
+
+async def maybe_auto_summarize_session(
+    settings: Settings,
+    logical_session_id: str,
+) -> None:
+    """
+    在 chat_completions 成功返回后调用。
+    根据当前记录条数和上次 summary 的 total_records 决定是否重新 summarization。
+    """
+    records = load_session_records(settings, logical_session_id)
+    total = len(records)
+    if total < MIN_RECORDS_FOR_SUMMARY:
+        return
+
+    summary = load_session_summary(settings, logical_session_id)
+    if summary is None:
+        print(
+            f"DEBUG auto-summarize check: logical_session_id={logical_session_id}, "
+            f"total={total}, seen=0, diff={total}"
+        )
+        await run_session_summarization(settings, logical_session_id)
+        return
+
+    seen_raw = summary.get("total_records", 0) if isinstance(summary, dict) else 0
+    try:
+        seen = int(seen_raw)
+    except (TypeError, ValueError):
+        seen = 0
+
+    diff = total - seen
+    print(
+        f"DEBUG auto-summarize check: logical_session_id={logical_session_id}, "
+        f"total={total}, seen={seen}, diff={diff}"
+    )
+
+    if diff < UPDATE_EVERY_RECORDS:
+        return
+
+    await run_session_summarization(settings, logical_session_id)
 
 
 @app.get("/health")
@@ -421,6 +522,30 @@ async def chat_completions(request: Request) -> Any:
         raise HTTPException(status_code=400, detail="Streaming is not supported yet.")
 
     settings = get_settings()
+    headers = request.headers
+    logical_session_id = headers.get("x-logical-session-id") or payload.get(
+        "logical_session_id"
+    )
+
+    messages = payload.get("messages")
+    log_request_messages = messages if isinstance(messages, list) else []
+
+    if logical_session_id and isinstance(messages, list):
+        try:
+            new_messages = build_messages_with_memory(
+                settings=settings,
+                logical_session_id=logical_session_id,
+                original_messages=messages,
+            )
+            payload["messages"] = new_messages
+            print(
+                "DEBUG injected memory for logical_session_id="
+                f"{logical_session_id}, orig_len={len(messages)}, "
+                f"new_len={len(new_messages)}"
+            )
+        except Exception as exc:
+            print(f"DEBUG build_messages_with_memory failed: {exc!r}")
+
     url = f"{settings.openrouter_base_url}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
@@ -447,20 +572,37 @@ async def chat_completions(request: Request) -> Any:
         )
         raise HTTPException(status_code=response.status_code, detail=response.text)
 
+    response_data = response.json()
+
+    append_ok = False
+    if logical_session_id and isinstance(messages, list):
+        try:
+            reply_message = (
+                response_data.get("choices", [{}])[0]
+                .get("message", {})
+            )
+            if isinstance(reply_message, dict):
+                append_chat_log(
+                    settings=settings,
+                    logical_session_id=logical_session_id,
+                    request_messages=log_request_messages,
+                    reply_message=reply_message,
+                )
+                append_ok = True
+        except Exception as exc:
+            print(f"DEBUG append_chat_log failed: {exc!r}")
+
+    if logical_session_id and append_ok:
+        try:
+            asyncio.create_task(
+                maybe_auto_summarize_session(settings, logical_session_id)
+            )
+        except Exception as exc:
+            print(f"DEBUG maybe_auto_summarize_session failed: {exc!r}")
+
     print(f"DEBUG OpenRouter status: {response.status_code}")
     print(f"DEBUG OpenRouter body (first 200 chars): {response.text[:200]!r}")
-    data =  response.json()
-    try:
-        append_chat_log(
-            settings=settings,
-            request=request,
-            payload=payload,
-            raw_response=data,
-        )
-    except Exception as exc:
-        print(f"DEBUG append_chat_log failed: {exc!r}")
-
-    return data
+    return response_data
 
 
 @app.post("/internal/summarize_session")
@@ -479,10 +621,7 @@ async def summarize_session(payload: dict[str, str] = Body(...)) -> Any:
 
     settings = get_settings()
 
-    result = await generate_session_summary(settings, logical_session_id)
-
-    if result.get("status") == "ok":
-        save_session_summary(settings, logical_session_id, result)
+    result = await run_session_summarization(settings, logical_session_id)
 
     return {
         "logical_session_id": logical_session_id,
