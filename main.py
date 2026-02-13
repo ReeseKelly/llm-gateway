@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -11,13 +12,20 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from httpx_socks import AsyncProxyTransport
 
 from config import Settings, get_settings
+from memories import(
+    add_pinned_memory, 
+    list_pinned_memories_by_session,
+    select_relevant_pinned_memories,
+) 
 
 app = FastAPI()
 
 MAX_RECENT_RECORDS = 5
 MAX_RECENT_TEXT_CHARS = 200
-MIN_RECORDS_FOR_SUMMARY = 4
-UPDATE_EVERY_RECORDS = 5
+MIN_RECORDS_FOR_SUMMARY = 10
+UPDATE_EVERY_RECORDS = 8
+MAX_PIN_RECORDS = 12
+MAX_PINNED_MEMORIES_PER_SESSION = 3
 
 SUMMARY_SYSTEM_PROMPT = """You are a summarization model that maintains a rolling memory for a long-running, high-context conversation between a single user and an assistant.
 
@@ -45,6 +53,42 @@ Output format (MUST be valid JSON, no extra text):
   ]
 }
 """
+
+PINNED_SUMMARY_SYSTEM_PROMPT = """
+You are a summarization model that creates long-term, reusable memory cards
+from a short conversation segment between a user and an assistant.
+
+Your task:
+- Focus ONLY on information that will remain useful across future sessions:
+  - stable preferences and likes/dislikes
+  - important facts about the user's projects, goals, and constraints
+  - key decisions, commitments, or rules of thumb they rely on
+  - recurring emotional / cognitive patterns that matter for future support
+- Ignore ephemeral details (timestamps, one-off small-talk) unless they reveal
+  a stable pattern or important context.
+- Do NOT restate the entire conversation. Compress it into a small, reusable card.
+
+Output:
+Write 3–6 sentences in plain text. It should be readable as a standalone note
+for future assistants, without referring to "this conversation above".
+"""
+
+def strip_kelivo_autoprompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    清理 Kelivo 注入的自动提示段（Memory Tool 说明等），
+    目前只处理第一条 system message 里的 '## Memory Tool' 段。
+    """
+    cleaned: list[dict[str, Any]] = []
+    for idx, msg in enumerate(messages):
+        if idx == 0 and msg.get("role") == "system":
+            content = str(msg.get("content", ""))
+            # 移除从 '## Memory Tool' 开始到文本结束的所有内容
+            if "## Memory Tool" in content:
+                content = re.sub(r"## Memory Tool[\s\S]*$", "", content)
+            msg = {**msg, "content": content}
+        cleaned.append(msg)
+    return cleaned
+
 
 
 def build_httpx_client_kwargs(settings: Settings) -> dict[str, Any]:
@@ -125,7 +169,7 @@ def load_session_summary(
     - 如果没有这个 logical_session_id，返回 None
     - 解析失败时打印一行 debug 并返回 None
     """
-    path = Path(settings.log_dir) / "session_summaries.json"
+    path = get_summary_store_path(settings)
     if not path.exists():
         return None
 
@@ -209,6 +253,239 @@ def build_messages_with_memory(
     return [memory_system_message] + original_messages
 
 
+def extract_recent_user_text(history_messages: list[dict[str, Any]], max_messages: int = 2) -> str:
+    """
+    从 history_messages 里取最近 max_messages 条 user 消息，拼成一段文本。
+    用来做 keyword 粗筛的输入。
+    """
+    if not isinstance(history_messages, list):
+        return ""
+
+    user_texts: list[str] = []
+    for msg in reversed(history_messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            content = str(msg.get("content", "")).strip()
+            if content:
+                user_texts.append(content)
+                if len(user_texts) >= max_messages:
+                    break
+
+    user_texts.reverse()
+    return "\n".join(user_texts)
+
+
+def should_pin_from_messages(messages: list[dict[str, Any]]) -> bool:
+    """
+    Return True if the last user message appears to request pinning,
+    e.g. contains '/pin'.
+    """
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = str(message.get("content", ""))
+            return "/pin" in content
+    return False
+
+
+def estimate_tokens_for_messages(messages: list[dict[str, Any]]) -> int:
+    """
+    Roughly estimate token usage for a list of messages.
+    """
+    total_chars = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = str(message.get("content", ""))
+        total_chars += len(content)
+    return total_chars // 2
+
+
+def apply_context_budget(
+    settings: Settings,
+    system_messages: list[dict[str, Any]],
+    history_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Build the final `messages` list to send to OpenRouter, enforcing
+    an approximate context budget.
+
+    - `system_messages`: all system-level messages to always try to keep
+      (base system prompt, session summary, future pinned memories as system messages).
+    - `history_messages`: raw chat history from the client (user + assistant).
+    """
+    initial_messages = system_messages + history_messages
+    tokens_before = estimate_tokens_for_messages(initial_messages)
+    print(f"DEBUG context tokens before trim: {tokens_before}")
+
+    if tokens_before <= settings.context_max_tokens:
+        return initial_messages
+
+    user_indexes = [
+        idx for idx, msg in enumerate(history_messages) if msg.get("role") == "user"
+    ]
+    assistant_indexes = [
+        idx
+        for idx, msg in enumerate(history_messages)
+        if msg.get("role") == "assistant"
+    ]
+    
+    system_history_indexes = [
+        idx
+        for idx, msg in enumerate(history_messages)
+        if msg.get("role") == "system"
+    ]
+
+    keep_indexes: set[int] = set(user_indexes[-settings.context_keep_last_user_messages :])
+    keep_indexes.update(
+        assistant_indexes[-settings.context_keep_last_assistant_messages :]
+    )
+
+    current_history = list(history_messages)
+    num_trimmed = 0
+
+    def _build_messages(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return system_messages + items
+
+    for idx in range(len(history_messages)):
+        if idx in keep_indexes or idx in system_history_indexes:
+            continue
+
+        if idx >= len(current_history):
+            break
+
+        if current_history[idx] is None:
+            continue
+
+        current_history[idx] = None
+        candidate = [msg for msg in current_history if msg is not None]
+        candidate_tokens = estimate_tokens_for_messages(_build_messages(candidate))
+        num_trimmed += 1
+        if candidate_tokens <= settings.context_max_tokens:
+            print(f"DEBUG context tokens after trim: {candidate_tokens}")
+            print(f"DEBUG trimmed {num_trimmed} history messages for context budget")
+            return _build_messages(candidate)
+
+    minimal_history = [
+        msg
+        for idx, msg in enumerate(history_messages)
+        if idx in keep_indexes or msg.get("role") == "system"
+    ]
+    final_messages = _build_messages(minimal_history)
+    tokens_after = estimate_tokens_for_messages(final_messages)
+    print(f"DEBUG context tokens after trim: {tokens_after}")
+    print(f"DEBUG trimmed {num_trimmed} history messages for context budget")
+    if tokens_after > settings.context_max_tokens:
+        print("DEBUG context still above budget after mandatory keep set")
+    return final_messages
+
+
+def _build_pin_conversation_segment(records: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for record in records:
+        request_messages = record.get("request_messages", [])
+        if isinstance(request_messages, list):
+            for msg in request_messages:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                lines.append(f"{role}: {content}")
+
+        reply_message = record.get("reply_message")
+        if isinstance(reply_message, dict):
+            role = reply_message.get("role", "assistant")
+            content = reply_message.get("content", "")
+            lines.append(f"{role}: {content}")
+
+    return "\n".join(lines)
+
+
+async def create_pinned_memory_from_session(
+    settings: Settings,
+    logical_session_id: str,
+    model_name: str | None = None,
+) -> str | None:
+    records = load_session_records(settings, logical_session_id)
+    if not records:
+        print(f"DEBUG no records available to pin for session={logical_session_id}")
+        return None
+
+    selected_records = records[-MAX_PIN_RECORDS:]
+    segment = _build_pin_conversation_segment(selected_records)
+
+    model_to_use = model_name or settings.summary_model
+
+    payload = {
+        "model": model_to_use,
+        "stream": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    PINNED_SUMMARY_SYSTEM_PROMPT,
+                ),
+            },
+            {"role": "user", "content": segment},
+        ],
+    }
+
+    url = f"{settings.openrouter_base_url}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(**build_httpx_client_kwargs(settings)) as client:
+            response = await client.post(url, json=payload, headers=headers)
+    except Exception as exc:
+        print(f"DEBUG pinned memory summarizer call failed: {exc!r}")
+        return None
+
+    if response.status_code >= 400:
+        print(
+            f"DEBUG pinned memory summarizer upstream error: "
+            f"{response.status_code} {response.text[:200]!r}"
+        )
+        return None
+
+    try:
+        data = response.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception as exc:
+        print(f"DEBUG failed to parse pinned memory response: {exc!r}")
+        return None
+
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    from_ts = selected_records[0].get("timestamp") if selected_records else None
+    to_ts = selected_records[-1].get("timestamp") if selected_records else None
+
+    memory = {
+        "logical_session_id": logical_session_id,
+        "kind" : "pin",
+        "scope" : "session",
+        "topic": None,
+        "keywords": [],
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "source": {
+            "from_timestamp": from_ts,
+            "to_timestamp": to_ts,
+            "num_records": len(selected_records),
+        },
+        "content": str(content).strip(),
+        "tags": ["pinned"],
+        "importance": "high",
+    }
+
+    mem_id = add_pinned_memory(settings, memory)
+    print(
+        f"DEBUG pinned memory created: id={mem_id}, "
+        f"logical_session_id={logical_session_id}, "
+        f"num_records={len(selected_records)}"
+    )
+    return mem_id
+
+
 def build_recent_messages_for_session(
     settings: Settings,
     logical_session_id: str,
@@ -251,10 +528,14 @@ def append_chat_log(
     reply_message: dict[str, Any],
 ) -> None:
     path = get_chat_log_path(settings)
+
+    # 只保留“这一轮新增的对话 turn”
+    trimmed_request = extract_new_turn(request_messages)
+
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "logical_session_id": logical_session_id,
-        "request_messages": request_messages,
+        "request_messages": trimmed_request,
         "reply_message": reply_message,
     }
     try:
@@ -262,6 +543,7 @@ def append_chat_log(
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
         print(f"DEBUG failed to append chat log: {exc!r}")
+
 
 
 def get_summary_store_path(settings: Settings) -> Path:
@@ -319,6 +601,49 @@ def save_session_summary(
     except Exception as exc:
         print(f"DEBUG failed to save session summary: {exc!r}")
 
+def extract_new_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    从完整的 messages 列表中抽取“最新的一轮对话”：
+    - 最后一个 user message
+    - 以及它前面最近的一个 assistant message（如果存在）
+
+    如果没找到 user，就直接返回原 messages。
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages
+
+    last_user = None
+    prev_assistant = None
+
+    # 从后往前扫，先找到最后一个 user
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "user" and last_user is None:
+            last_user = msg
+            # 再继续往前找 assistant
+            for j in range(idx - 1, -1, -1):
+                m2 = messages[j]
+                if isinstance(m2, dict) and m2.get("role") == "assistant":
+                    prev_assistant = m2
+                    break
+            break
+
+    if last_user is None:
+        # 没找到 user，就不强行裁剪
+        return [m for m in messages if isinstance(m, dict) and m.get("role") != "system"]
+
+    result: list[dict[str, Any]] = []
+    if prev_assistant is not None:
+        result.append(prev_assistant)
+    result.append(last_user)
+
+    # 最终结果再次确保没有 system
+    result = [m for m in result if m.get("role") != "system"]
+    return result
+
 
 async def run_session_summarization(
     settings: Settings, logical_session_id: str
@@ -332,7 +657,7 @@ async def run_session_summarization(
     if not records:
         return {"status": "no_records", "detail": "No records for this session."}
 
-    if len(records) < 4:
+    if len(records) < MIN_RECORDS_FOR_SUMMARY:
         return {
             "status": "too_short",
             "detail": "Not enough records to summarize.",
@@ -518,6 +843,8 @@ async def chat_completions(request: Request) -> Any:
     print(f"DEBUG incoming payload keys: {list(payload.keys())}")
     print(f"DEBUG stream flag: {payload.get('stream')}")
 
+    model_name_in_request = payload.get("model")
+
     if payload.get("stream") is True:
         raise HTTPException(status_code=400, detail="Streaming is not supported yet.")
 
@@ -528,23 +855,100 @@ async def chat_completions(request: Request) -> Any:
     )
 
     messages = payload.get("messages")
-    log_request_messages = messages if isinstance(messages, list) else []
+    history_messages = messages if isinstance(messages, list) else []
 
-    if logical_session_id and isinstance(messages, list):
+    # 先清理 Kelivo 的自动提示（Memory Tool）
+    if isinstance(history_messages, list):
+        history_messages = strip_kelivo_autoprompt(history_messages)
+
+    # 记录日志用的是清理后的版本
+    log_request_messages = list(history_messages)
+
+    settings = get_settings()
+    headers = request.headers
+    logical_session_id = headers.get("x-logical-session-id") or payload.get("logical_session_id")
+
+    system_messages: list[dict[str, Any]] = []
+    if logical_session_id:
+        # 1) 注入session summary
         try:
-            new_messages = build_messages_with_memory(
+            summary_obj = load_session_summary(settings, logical_session_id)
+            summary_text = summary_obj.get("summary") if isinstance(summary_obj, dict) else None
+            if summary_text:
+                system_messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "[SESSION SUMMARY - ASYNC, MAY BE INCOMPLETE]\n"
+                            "This is an automatically generated rolling summary of past interactions "
+                            "for this logical_session_id. It may lag behind or omit some details.\n\n"
+                            "When answering:\n"
+                            "- Use this summary only as background context.\n"
+                            "- Always trust the user's explicit, current messages over this summary.\n"
+                            "- If the summary seems to conflict with the recent messages, ask the user "
+                            "to clarify which version is correct before relying on it.\n\n"
+                            f"{summary_text}"
+                        ),
+                    }
+                )
+        except Exception as exc:
+            print(f"DEBUG load_session_summary failed: {exc!r}")
+
+        # 2) 只在match时注入pinned
+        try:
+            current_text = extract_recent_user_text(history_messages, max_messages = 2)
+            if current_text:
+                relevant_pins = select_relevant_pinned_memories(
+                    settings = settings,
+                    logical_session_id = logical_session_id,
+                    current_text = current_text,
+                    max_memories = 3,
+                )
+                if relevant_pins:
+                    lines: list[str] = []
+                    for idx, mem in enumerate(relevant_pins, start = 1):
+                        topic = mem.get("topic") or "general"
+                        summary = (mem.get("summary") or mem.get("content") or "").strip()
+                        if not summary:
+                            continue
+                        lines.append(f"[{idx}] topic={topic}\n{summary}")
+                    
+                    if lines:
+                        pinned_text = "\n\n".join(lines)
+                        system_messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "[PINNED NOTES]\n"
+                                    "These are pinned notes that appear relevant to the current messages.\n"
+                                    "Treat them as helpful background. If they conflict with the user's current message, "
+                                    "prefer the user's current message and ask.\n\n"
+                                    f"{pinned_text}"
+                                ),
+                            }
+                        )   
+
+                        print(f"DEBUG current_text for pin selection: {current_text!r}")
+                        print(f"DEBUG relevant_pins count: {len(relevant_pins)}")
+
+
+        except Exception as exc:
+            print(f"DEBUG injecting pinned notes failed: {exc!r}")
+
+    if isinstance(messages, list):
+        try:
+            final_messages = apply_context_budget(
                 settings=settings,
-                logical_session_id=logical_session_id,
-                original_messages=messages,
+                system_messages=system_messages,
+                history_messages=history_messages,
             )
-            payload["messages"] = new_messages
+            payload["messages"] = final_messages
             print(
-                "DEBUG injected memory for logical_session_id="
-                f"{logical_session_id}, orig_len={len(messages)}, "
-                f"new_len={len(new_messages)}"
+                "DEBUG context budget applied, "
+                f"history_len={len(history_messages)}, final_len={len(final_messages)}"
             )
         except Exception as exc:
-            print(f"DEBUG build_messages_with_memory failed: {exc!r}")
+            print(f"DEBUG apply_context_budget failed: {exc!r}")
 
     url = f"{settings.openrouter_base_url}/v1/chat/completions"
     headers = {
@@ -600,9 +1004,32 @@ async def chat_completions(request: Request) -> Any:
         except Exception as exc:
             print(f"DEBUG maybe_auto_summarize_session failed: {exc!r}")
 
+    if logical_session_id and should_pin_from_messages(log_request_messages):
+        try:
+            # 优先用这次请求里指定的模型，如果没写model，就退回summary_model
+            model_for_pin = str(model_name_in_request or settings.summary_model)
+            asyncio.create_task(
+                create_pinned_memory_from_session(settings, logical_session_id, model_name = model_for_pin)
+            )
+        except Exception as exc:
+            print(f"DEBUG create_pinned_memory_from_session failed: {exc!r}")
+
     print(f"DEBUG OpenRouter status: {response.status_code}")
     print(f"DEBUG OpenRouter body (first 200 chars): {response.text[:200]!r}")
     return response_data
+
+
+@app.post("/internal/list_pinned_memories")
+async def list_pinned(payload: dict[str, str] = Body(...)) -> Any:
+    logical_session_id = payload.get("logical_session_id")
+    if not logical_session_id:
+        raise HTTPException(status_code=400, detail="logical_session_id is required")
+
+    settings = get_settings()
+    return {
+        "logical_session_id": logical_session_id,
+        "memories": list_pinned_memories_by_session(settings, logical_session_id),
+    }
 
 
 @app.post("/internal/summarize_session")

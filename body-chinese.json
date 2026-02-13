@@ -1,0 +1,11 @@
+{
+  "model": "openai/gpt-4o-mini",
+  "logical_session_id": "demo-chinese-001",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请你不要解释，原样重复这一句：你好，网关测试123！"
+    }
+  ],
+  "stream": false
+}
