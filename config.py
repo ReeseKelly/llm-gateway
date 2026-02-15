@@ -17,11 +17,15 @@ class Settings:
     summary_max_turns: int = 40
     summary_store_path: str = "session_summaries.json"
 
-    pinned_summary_model: str | None = None
-
-    context_max_tokens: int = 4000
+    context_max_tokens: int = 9000
     context_keep_last_user_messages: int = 4
     context_keep_last_assistant_messages: int = 4
+
+    memory_max_candidates: int = 5
+    memory_activation_ttl: int = 3
+    memory_consolidation_enabled: bool = False
+    memory_consolidation_min_count: int = 3
+    memory_consolidation_model: str = ""
 
 
 def _safe_int(value: str | None, default: int) -> int:
@@ -31,6 +35,12 @@ def _safe_int(value: str | None, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _safe_bool(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_settings() -> Settings:
@@ -53,4 +63,13 @@ def get_settings() -> Settings:
         context_keep_last_assistant_messages=_safe_int(
             os.getenv("CONTEXT_KEEP_LAST_ASSISTANT_MESSAGES"), 4
         ),
+        memory_max_candidates=_safe_int(os.getenv("MEMORY_MAX_CANDIDATES"), 5),
+        memory_activation_ttl=_safe_int(os.getenv("MEMORY_ACTIVATION_TTL"), 3),
+        memory_consolidation_enabled=_safe_bool(
+            os.getenv("MEMORY_CONSOLIDATION_ENABLED"), False
+        ),
+        memory_consolidation_min_count=_safe_int(
+            os.getenv("MEMORY_CONSOLIDATION_MIN_COUNT"), 3
+        ),
+        memory_consolidation_model=os.getenv("MEMORY_CONSOLIDATION_MODEL", ""),
     )
