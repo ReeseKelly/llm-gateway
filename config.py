@@ -13,7 +13,7 @@ class Settings:
     outbound_proxy_url: str | None = None
     log_dir: str = "logs"
 
-    summary_model: str = "openai/gpt-4o-mini"
+    summary_model: str = "deepseek/deepseek-v3.2"
     summary_max_turns: int = 40
     summary_store_path: str = "session_summaries.json"
 
@@ -53,7 +53,7 @@ def get_settings() -> Settings:
         openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api"),
         outbound_proxy_url=os.getenv("OUTBOUND_PROXY_URL"),
         log_dir=os.getenv("LOG_DIR", "logs"),
-        summary_model=os.getenv("SUMMARY_MODEL", "openai/gpt-4o-mini"),
+        summary_model=os.getenv("SUMMARY_MODEL", "deepseek/deepseek-v3.2"),
         summary_max_turns=_safe_int(os.getenv("SUMMARY_MAX_TURNS"), 40),
         summary_store_path=os.getenv("SUMMARY_STORE_PATH", "session_summaries.json"),
         context_max_tokens=_safe_int(os.getenv("CONTEXT_MAX_TOKENS"), 3500),
