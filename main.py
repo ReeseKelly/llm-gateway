@@ -606,6 +606,7 @@ def build_memories_system_message(active_memories: list[dict[str, Any]]) -> dict
     lines.append(
         "These memories come from our past interactions, retrieved based on topic/pattern relevance. "
         "Treat them as background context—when in doubt, trust what Reese says directly and ask if something seems off."
+        "Summaries may lose emotional texture. Preserved facts/topics, but tone may drift clinical/observational. Check live messages for actual quality of exchange."
     )
     lines.append("")
 
