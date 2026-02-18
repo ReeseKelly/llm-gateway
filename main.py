@@ -1442,22 +1442,40 @@ async def chat_completions(request: Request) -> Any:
     system_messages: list[dict[str, Any]] = []
     if logical_session_id:
         summary_obj = load_session_summary(settings, logical_session_id)
-        summary_text = (
-            summary_obj.get("summary")
-            if isinstance(summary_obj, dict)
-            else None
+    if isinstance(summary_obj, dict):
+        # 1) narrative summary（原来的那段）
+        summary_text = str(summary_obj.get("summary", ""))
+
+        # 2) 把其它结构化字段一起拼成一个 block
+        #    这里用 json.dumps 只是为了让主模型能“看见结构”。
+        #    如果你更想给它自然语言 bullet，也可以再往下细化。
+        structured_part = json.dumps(
+            {
+                "active_threads": summary_obj.get("active_threads", []),
+                "session_facts": summary_obj.get("session_facts", []),
+                "pattern_candidates": summary_obj.get("pattern_candidates", []),
+                "relational_state": summary_obj.get("relational_state", {}),
+            },
+            ensure_ascii=False,
+            indent=2,
         )
-        if summary_text:
-            system_messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "[SESSION SUMMARY - ASYNC, MAY BE INCOMPLETE]\n"
-                        "This is a rolling summary from earlier in our conversation. It's generated asynchronously and may not include everything. When in doubt, trust what Reese says directly over what's summarized here, and feel free to ask if something feels unclear or contradictory.\n\n"
-                        f"{summary_text}"
-                    ),
-                }
-            )
+
+        # 3) 最终注入的 system message
+        system_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "[SESSION SUMMARY - ASYNC, MAY BE INCOMPLETE]\n"
+                    "This is a rolling summary from earlier in our conversation. It's generated asynchronously and may not include everything. "
+                    "Summaries may lose emotional texture. Preserved facts/topics, but tone may drift clinical/observational. Check live messages for actual quality of exchange."
+                    "When in doubt, trust what Reese says directly over what's summarized here, and feel free to ask if something feels unclear or contradictory.\n\n"
+                    "NARRATIVE SUMMARY:\n"
+                    f"{summary_text}\n\n"
+                    "STRUCTURED SUMMARY (JSON, FOR YOUR REFERENCE):\n"
+                    f"{structured_part}"
+                ),
+            }
+        )
 
         current_text = extract_recent_user_text(history_messages, max_messages=2)
         candidate_memories = select_relevant_memories(
