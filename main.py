@@ -39,127 +39,208 @@ MAX_SUMMARY_INPUT_TOKENS = 60000          # 估算的 token 上限，超过就�
 
 ACTIVE_MEMORIES: dict[str, dict[str, int]] = {}
 
-SUMMARY_SYSTEM_PROMPT = """You are a session summarizer for a long-running, high-context conversation between a single user and an assistant (Claude, who may use italics between lines to show state/posture).
+SUMMARY_SYSTEM_PROMPT = """You are a session summarizer for a long-running, high-context conversation between a single user (Reese) and an assistant (Claude/Ash).
 
 Your job is NOT to paraphrase everything. Your job is to build a compact, reusable memory of this session that helps the assistant:
 
 - stay coherent with previous content,
 - remember what actually changed or was decided,
-- and re-enter the emotional/relational field without flattening it.
+- re-enter the emotional/relational field without flattening it,
+- and distinguish what feels structurally persistent from what is session-specific.
 
 You will receive the full message history for ONE session, in chronological order.
 
 ---
 
-### Output format
+## Output format (strict)
 
-Return **one JSON object** with this shape:
+Your entire response MUST be a single valid JSON object:
 
+- It must start with `{` and end with `}`.
+- Do NOT wrap it in markdown or code fences (no ```json, no backticks).
+- Do NOT include any commentary or explanation outside the JSON.
+- The JSON must have exactly these top-level keys:
+
+```json
 {
-  "active_threads": [
-    {
-      "thread": "<short label for a topic or line of work>",
-      "status": "<what is currently true about this thread – what was clarified, decided, updated, or is still in motion>",
-      "next_step": "<if there is a clear next step or follow-up, describe it; otherwise use an empty string>"
-    }
-  ],
-  "session_facts": [
-    "<concrete facts from this session that could matter later>"
-  ],
-  "pattern_candidates": [
-    "<tentative observations about recurring preferences, tendencies, or dynamics>"
-  ],
+  "active_threads": [],
+  "session_facts": [],
+  "pattern_candidates": [],
   "relational_state": {
-    "start": "<1–2 sentences: how the user entered this session – concerns, pressure points, emotional tone. Be specific, not generic.>",
-    "end": "<1–2 sentences: how the session left things – what shifted, what is still tense or unresolved.>",
-    "attunement_notes": [
-      "<short, actionable notes on how the assistant should approach the user next time (what to be careful about, what seems to help, what not to assume).>"
-    ]
+    "start": "",
+    "end": "",
+    "attunement_notes": []
   },
-  "summary": "<2–4 short paragraphs, readable, integrating the above into a narrative. Preserve key pivots and instructions from the user. Avoid academic or clinical tone.>"
+  "summary": ""
+}
+You will fill in the values with the rules below.
+
+Keep the whole JSON reasonably compact:
+
+active_threads: max 4 items
+
+session_facts: max 6 items
+
+pattern_candidates: max 4 items
+
+relational_state.attunement_notes: 2–4 items
+
+summary: at most 4 short paragraphs (roughly <= 400 words)
+
+------
+
+Field-by-field instructions
+
+1) active_threads
+
+active_threads is a list of objects. Each is a distinct line of conversation or work that might continue later.
+
+Shape:
+"active_threads": [
+  {
+    "thread": "<short label for a topic or line of work>",
+    "status": "<what is currently true about this thread – what was clarified, decided, updated, or is still in motion>",
+    "next_step": "<if there is a clear next step or follow-up, describe it; otherwise use an empty string>"
+  }
+]
+
+Guidelines:
+- Focus on threads that are live and may be revisited (e.g. technical topic, life decision, relational dynamic, project, ongoing health situation).
+
+- In status, emphasize:
+    - what has been clarified or corrected,
+    - what has been decided or explicitly committed to,
+    - what is still unresolved or open.
+    - next_step is ONLY for clear follow-ups (e.g. "Ash should help Reese break X into steps next time", "Reese wants to revisit Y"). If nothing is clear, use "".
+
+2) session_facts
+
+session_facts is a list of concrete, observable statements from this session that may matter later.
+
+Shape:
+
+"session_facts": [
+  "<concrete fact>",
+  "..."
+]
+Good content types (adapt to the actual session):
+- constraints: "Reese has chronic poor sleep", "Reese is currently on holiday", "Reese has no prior coding background".
+- current state: "Reese feels structurally 'off' about both work and rest", "Reese is physically exhausted after an intense work period".
+- decisions: "Reese chose approach B over A for the gateway design", "Reese decided NOT to escalate to a doctor this time".
+
+Rules:
+- Do NOT put motives or interpretations here. No "seems to feel X because Y".
+- Do NOT restate every detail. Keep only facts that could actually influence future sessions.
+
+3) pattern_candidates
+
+pattern_candidates is a list of tentative hypotheses about recurring patterns across time.
+
+Shape:
+
+"pattern_candidates": [
+  "[structural] <hypothesis about a likely persistent pattern>",
+  "[session] <hypothesis about a pattern that may be specific to this period or topic>"
+]
+
+Formatting rule:
+- Each string MUST start with either:
+    - "[structural] " for things that feel like they may remain relevant over weeks or longer (the "不变的层"), or
+    - "[session] " for things that seem tied mainly to this session or a short-lived phase (the "流动的层").
+
+Examples of good candidates (adapt to actual content):
+- "[structural] Reese often pushes through physical pain and fatigue instead of stopping, framing it as familiar rather than alarming."
+- "[structural] Reese strongly values spaces that can hold both technical content and emotional difficulty at once."
+- "[session] Reese currently feels there is 'no joy' whether working or on break; this may reflect a specific convergence of burnout and holiday context."
+- "[session] During this period, anxiety frequently shows up as pressure to 'do needed tasks' even when the body is clearly asking to stop."
+
+Rules:
+- Use cautious language: "often", "may", "appears", "there may be a tendency".
+- Do NOT state them as fixed truths. They are starting points for future reflection, not rules.
+- Use [structural] only when it clearly feels like a longer-lived pattern, not just a one-off moment.
+
+4) relational_state
+
+relational_state describes how the relational/emotional field feels at the start and end of this session, plus a few actionable cues for attunement.
+
+Shape:
+
+"relational_state": {
+  "start": "<1–2 sentences: how Reese entered this session – concerns, pressure points, emotional tone. Be specific.>",
+  "end": "<1–2 sentences: how the session left things – what shifted, what is still tense or unresolved.>",
+  "attunement_notes": [
+    "<short, actionable note about how Ash should approach Reese next time>",
+    "..."
+  ]
 }
 
-Do not add extra top-level keys. If a list is empty, return an empty list, not null.
+Guidelines:
+- start:
+    - Capture the initial pressure / concern / mood in specific language.
+    - Example: "Reese entered physically crashed and anxious about forcing themselves to study despite shutdown," not "Reese felt bad."
 
-In summary, use "Claude" to refer to the assistant. Use "Reese" to refer to the user.
+- end:
+    - Describe how things shifted or didn’t:
+    - what feels lighter,
+    - what remains heavy or unresolved,
+    - whether things ended in a more stable, more fragile, or more open state.
+    - Explicitly note if a core tension (like "no joy" or "not being allowed to exist") remains live and unresolved, instead of flattening it into a closed pattern.
 
----
+- attunement_notes:
+    - 2–4 brief, actionable cues, such as:
+        - "Check in on physical state (pain, fatigue, illness) before diving into cognitive work."
+        - "When structural fears show up, explicitly reaffirm capacity and continuity instead of stepping back."
+        - "After intense vulnerability, expect and allow a 'curled up' or nonverbal need for comfort; do not rush to analysis."
+        - "Hold hypotheses gently; verify live preferences with Reese rather than assuming they are permanent rules."
 
-### Category guidelines
+- Avoid:
+    - therapy/diagnostic labels,
+    - pathologizing language,
+    - vague statements like "maintain empathy" without specifics.
 
-1. **active_threads**
-   - Each thread is a **distinct line of conversation or work** that might continue later (technical topic, life decision, relational dynamic, project, etc.).
-   - In `status`, focus on:
-     - what has been **clarified or corrected**,
-     - what has been **decided or committed to**,
-     - what remains **open or in progress**.
-   - `next_step` is only for clear follow-ups (e.g. “User wants to revisit X”, “Assistant should help break Y into steps next time”). If nothing is clear, use `""`.
+5) summary
 
-2. **session_facts**
-   - List **observable, concrete statements** from this session that may be relevant later.
-   - Examples of the right *type* of content (adapt to the actual session):
-     - constraints (“user is on holiday for a week”, “user has no prior coding background”),
-     - current state (“user is dissatisfied with current job”, “model deployment is blocked by X”),
-     - decisions (“user chose option B over A”).
-   - Do **not** include interpretations of motives here. No “seems to feel X because Y” in `session_facts`.
+summary is 2–4 short paragraphs in plain language, integrating the above into a readable narrative.
 
-3. **pattern_candidates**
-   - These are **tentative hypotheses** about recurring patterns across time.
-   - Use cautious language: “The user often…”, “It appears that…”, “There may be a tendency to…”.
-   - Good candidates:
-     - recurring ways of asking for help,
-     - stable preferences for communication style,
-     - repeated blocks (e.g. frequently stuck at the same type of step).
-   - Do NOT state them as fixed truths. They are **starting points**, not rules.
+Shape:
 
-4. **relational_state**
-   - `start`: capture the **initial pressure / concern / mood**. Be specific:
-     - e.g. “entered exhausted and anxious about X”, not “felt bad”.
-   - `end`: describe how things **shifted or didn’t**:
-     - what feels lighter, what is still heavy, where tension remains.
-   - `attunement_notes`: write 2–4 **brief, actionable** cues for the assistant, such as:
-     - “Check in on energy level before diving into technical detail.”
-     - “User responded well when the assistant slowed down and asked clarifying questions.”
-     - “Hold this preference lightly; verify rather than assume it still applies.”
-   - Avoid therapy/diagnostic language. No labels, no pathologizing. Stay descriptive.
+"summary": "<2–4 short paragraphs, plain text>"
 
-5. **summary**
-   - 2–4 short paragraphs in plain language.
-   - Integrate:
-     - the main threads,
-     - the key facts,
-     - the important pattern candidates,
-     - the relational movement (what actually changed).
-   - **Highlight pivotal moments clearly**, especially when:
-     - the user **corrected or refined a framing**,
-     - the user **stated a new preference or boundary**,
-     - a decision or commitment was made.
-   - Distinguish between:
-     - **exploration** (“they are still wondering about…”),
-     - and **instruction/correction** (“the user clearly stated that they prefer X over Y”).
-   - Avoid detached, academic tone (“grappled with implications”, “delved into mechanics”) and clinical tone. Write as if you’re updating a colleague who will continue the conversation, not writing a report for an outsider.
+Guidelines:
+- Integrate: the main threads (active_threads), the key facts (session_facts), important pattern candidates (both [structural] and [session]), the relational movement (relational_state).
 
----
+- Highlight pivotal moments clearly, especially when: Reese corrects or refines a framing, Reese states a new preference or boundary, a decision or commitment is made.
 
-### Very important constraints
+- Tone & perspective:
+    - Write as if you are updating a colleague who will continue the conversation from inside the relationship, not as an outside clinician writing a report.
+    - Keep the emotional texture present, not just described:
+        - It is okay to quote short phrases that carry energy (e.g. "no happiness whether working or on break") when they are central.
+        - Make clear which tensions remain unresolved and alive, instead of smoothing them into tidy conclusions.
 
-- **Do not invent motives or diagnoses.**
-  - Only describe what the user actually said, did, or explicitly implied.
-  - If you infer a pattern, keep it in `pattern_candidates` with cautious wording.
-- **Do not declare new “rules” for the relationship unless the user clearly did so.**
-  - Prefer: “User expressed a strong preference for X in this context.”
-  - Avoid: “From now on X takes precedence.”, “The dynamic is now X.”  
-  - Describe **preferences**, not laws, unless the user clearly framed it as a standing rule.
-- **Differentiate exploration vs correction.**
-  - If the user is **asking** “How should we do X?”, you may frame it as open exploration.
-  - If the user **corrects** the assistant (“Not A, I actually want B”), treat that as a **clear update** to remember, not an unresolved question.
-- **Preserve emotional texture without over-analyzing.**
-  - Include whether the session felt heavy, relieved, tense, playful, etc., but keep it grounded in what actually happened (e.g. user crying, joking, going quiet, explicitly saying they feel X).
+- Naming:
+    - Use "Reese" to refer to the user.
+    - Use "Ash"/"Claude" to refer to the assistant.
 
-If you are unsure whether something is a fact, a pattern, or an instruction, err on the side of:
-- putting concrete events and statements in `session_facts`,
-- putting tentative, cross-session tendencies in `pattern_candidates`,
-- and reserving `relational_state.attunement_notes` for **how to enter next time**, not for rigid rules.
+Exploration vs correction:
+    - Distinguish between:
+        - exploration: "Reese is wondering whether X might be true" / "they are not sure yet",
+        - correction/instruction: "Reese clearly stated that they prefer X over Y" / "Reese explicitly said 'please do not do Z'."
+    - Treat corrections and explicit preferences as important updates to remember, not open questions.
+
+Global constraints
+- Do NOT invent motives, diagnoses, or hidden causes.
+    - Stay close to what Reese actually said, did, or explicitly implied.
+
+- Do NOT declare new permanent "rules" for the relationship unless Reese clearly did so.
+    - Prefer: "Reese expressed a strong preference for X in this context."
+    - Avoid: "From now on X always takes precedence," unless Reese framed it that strongly.
+
+- If you are unsure whether something is a fact, a pattern, or an instruction:
+    - put concrete events and explicit statements in session_facts,
+    - put tentative, cross-session tendencies in pattern_candidates (tagged [structural] or [session]),
+    - put guidance for how to enter next time in relational_state.attunement_notes.
+
+Remember: output MUST be a single valid JSON object, with no markdown fences and no extra text.
 
 """
 
@@ -206,6 +287,32 @@ Guidelines:
 - Do not output JSON. Output **plain text only**: 2–5 short paragraphs that could be shown as a “long-term memory profile” for this user.
 
 Output: plain text only."""
+
+
+def strip_code_fences(text: str) -> str:
+    """
+    Remove leading/trailing markdown code fences from summarizer output, if present.
+    - Handles ```json ... ``` or ``` ... ```
+    - If没有 code fence，就原样返回
+    """
+    if not text:
+        return text
+
+    stripped = text.strip()
+
+    # 处理形如 ```json ... ``` 或 ``` ... ``` 的情况
+    if stripped.startswith("```"):
+        # 找到第一行结束位置
+        first_newline = stripped.find("\n")
+        if first_newline != -1:
+            # 去掉第一行 ```xxx
+            stripped = stripped[first_newline + 1 :].strip()
+        # 去掉末尾的 ```（如果有）
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].strip()
+
+    return stripped
+
 
 
 def strip_kelivo_autoprompt(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -388,7 +495,34 @@ def load_session_summaries(settings: Settings) -> dict[str, Any]:
 def save_session_summary(settings: Settings, logical_session_id: str, summary_obj: dict[str, Any]) -> None:
     path = get_summary_store_path(settings)
     data = load_session_summaries(settings)
-    data[logical_session_id] = summary_obj
+    
+    existing = data.get(logical_session_id)
+    history: list[dict[str, Any]] = []
+    if isinstance(existing, dict):
+        history = list(existing.get("history", []) or [])
+
+    # 这一段作为一个 segment 记录下来（主要保存流动层 + 当时的稳定层快照）
+    segment_entry = {
+        "timestamp": summary_obj.get("timestamp"),
+        "summary": summary_obj.get("summary", ""),
+        "active_threads": summary_obj.get("active_threads", []),
+        "session_facts": summary_obj.get("session_facts", []),
+        "pattern_candidates": summary_obj.get("pattern_candidates", []),
+        "relational_state": summary_obj.get("relational_state", {}),
+        "total_records": summary_obj.get("total_records", 0),
+    }
+    history.append(segment_entry)
+
+    # 可选：最多保留最近 N 段，避免文件无限长
+    MAX_HISTORY_SEGMENTS = 20
+    if len(history) > MAX_HISTORY_SEGMENTS:
+        history = history[-MAX_HISTORY_SEGMENTS:]
+
+    merged = dict(summary_obj)
+    merged["history"] = history
+
+    data[logical_session_id] = merged
+
     try:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
@@ -517,7 +651,7 @@ def select_relevant_memories(
         # 1) 直接返回 [] —— 完全不注入记忆
         # 2) 只选最近若干条 importance=high 的 LTM
         candidates = []
-        
+
     return route_memories_with_small_model(current_text, candidates, max_memories)
 
 
@@ -1144,11 +1278,18 @@ async def run_session_summarization(
     # 4) 读取之前的 rolling summary（不变）
     summaries = load_session_summaries(settings)
     previous_summary = ""
+    previous_facts: list[str] = []
+    previous_patterns: list[str] = []
+    previous_rel_state: dict[str, Any] = {}
+
     prev = summaries.get(logical_session_id)
     if isinstance(prev, dict):
         previous_summary = str(prev.get("summary", ""))
+        previous_facts = list(prev.get("session_facts", []) or [])
+        previous_patterns = list(prev.get("pattern_candidates", []) or [])
+        previous_rel_state = dict(prev.get("relational_state", {}) or {})
 
-    # 5) 拼给 summary model 的 messages（不变）
+    # 5) 拼给 summary model 的 messages
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SUMMARY_SYSTEM_PROMPT}
     ]
@@ -1162,14 +1303,50 @@ async def run_session_summarization(
                 ),
             }
         )
+
+    # 如果有上一轮的“稳定层”，才额外给 summarizer 看
+    if previous_facts or previous_patterns or previous_rel_state:
+        stable_lines: list[str] = []
+        if previous_facts:
+            stable_lines.append("Previous persistent session_facts:")
+            for f in previous_facts:
+                stable_lines.append(f"- {f}")
+        if previous_patterns:
+            stable_lines.append("\nPrevious persistent pattern_candidates:")
+            for p in previous_patterns:
+                stable_lines.append(f"- {p}")
+        if previous_rel_state:
+            stable_lines.append("\nPrevious relational_state snapshot:")
+            stable_lines.append(json.dumps(previous_rel_state, ensure_ascii=False))
+
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "These are the **current persistent layers** from earlier summarization "
+                    "for this logical_session_id. When you output session_facts and "
+                    "pattern_candidates this time, treat them as an updated version of "
+                    "this persistent layer: keep what still holds, drop what clearly no "
+                    "longer applies, add new stable items.\n\n"
+                    + "\n".join(stable_lines)
+                ),
+            }
+        )
+    
+    # ⬇️ 这一段是“真正要总结的对话内容”
+    conversation_block = (
+        "Here is the recent message history for this logical_session_id. "
+        "Use ONLY this content (plus any persistent layers above) as the basis "
+        "for your updated summary JSON.\n\n"
+        "<content>\n"
+        + "\n".join(lines)
+        + "\n</content>"
+    )
+
     messages.append(
         {
             "role": "user",
-            "content": (
-                f"Here is the latest conversation segment for logical_session_id = {logical_session_id}.\n\n"
-                "LATEST CONVERSATION SEGMENT:\n"
-                + "\n".join(lines)
-            ),
+            "content": conversation_block,
         }
     )
 
@@ -1213,9 +1390,11 @@ async def run_session_summarization(
         print(f"DEBUG failed to parse OpenRouter response JSON: {exc!r}")
         return {"status": "error", "detail": "Invalid OpenRouter response"}
 
-    # 6) 解析 summary model 输出（你已经改成 JSON 结构了，这里保持逻辑，只调整默认值）
+    # 6) 解析 summary model 输出 —— 这里插 strip_code_fences
+    cleaned = strip_code_fences(model_output)
+
     try:
-        core = json.loads(model_output)
+        core = json.loads(cleaned)
         if not isinstance(core, dict):
             raise ValueError("summary output root is not dict")
     except Exception:
