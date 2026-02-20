@@ -3,3 +3,4 @@ uvicorn
 httpx[socks]
 httpx-socks
 python-dotenv
+pydantic-settings>=2.0.0
