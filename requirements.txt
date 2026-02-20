@@ -4,3 +4,4 @@ httpx[socks]
 httpx-socks
 python-dotenv
 pydantic-settings>=2.0.0
+APScheduler>=3.10.4,<4.0
