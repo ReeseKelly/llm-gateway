@@ -35,8 +35,8 @@ app = FastAPI()
 app.include_router(telegram_router)
 init_telegram(app)
 
-MIN_RECORDS_FOR_SUMMARY = 5
-UPDATE_EVERY_RECORDS = 5
+MIN_RECORDS_FOR_SUMMARY = 8
+UPDATE_EVERY_RECORDS = 10
 MAX_PIN_RECORDS = 12
 
 # ✨ 新增：summarizer 输入安全相关的常量
