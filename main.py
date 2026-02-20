@@ -23,14 +23,20 @@ from memories import (
     load_pinned_memories,
 )
 
+from telegram_adapter import router as telegram_router, init_telegram
+
 MAX_PINNED_FOR_CONTEXT = 3          # 每次最多给主模型看的 pinned 数量
 MAX_LTM_FOR_CONTEXT = 2             # 每次最多给主模型看的 LTM 数量
 MAX_MEMORY_SUMMARY_CHARS = 800      # 每条记忆注入时的最大字符数
 
 app = FastAPI()
 
-MIN_RECORDS_FOR_SUMMARY = 8
-UPDATE_EVERY_RECORDS = 10
+# 先初始化 Telegram 相关
+app.include_router(telegram_router)
+init_telegram(app)
+
+MIN_RECORDS_FOR_SUMMARY = 5
+UPDATE_EVERY_RECORDS = 5
 MAX_PIN_RECORDS = 12
 
 # ✨ 新增：summarizer 输入安全相关的常量
@@ -602,18 +608,23 @@ def select_relevant_memories(
     include_kinds: tuple[str, ...] = ("pin", "ltm"),
 ) -> list[dict[str, Any]]:
     """
-    Coarse selection of candidate memories (pin + LTM).
+    先用 keyword / importance 做粗筛。
+    如果完全没有 keyword 命中，则 fallback 到“最近 / 高重要度”的若干条。
+    最后交给小模型做精细路由。
     """
     _ = settings
     tokens = tokenize_text(current_text)
 
+    # 1) 收集候选
     candidates: list[dict[str, Any]] = []
+
     if "pin" in include_kinds:
         for mem in load_pinned_memories(settings).values():
             if not isinstance(mem, dict):
                 continue
             if mem.get("kind", "pin") != "pin":
                 continue
+            # session-scope 的 pin 只在同一个 logical_session_id 下生效
             if mem.get("scope", "session") == "session" and mem.get("logical_session_id") != logical_session_id:
                 continue
             candidates.append(dict(mem))
@@ -624,10 +635,16 @@ def select_relevant_memories(
                 continue
             if mem.get("kind", "ltm") != "ltm":
                 continue
+            # 目前只用 global LTM
             if mem.get("scope", "global") != "global":
                 continue
             candidates.append(dict(mem))
 
+    # 如果现在还一个都没有，直接返回空
+    if not candidates:
+        return []
+
+    # 2) 计算 keyword 命中数 + importance 等粗评分
     for mem in candidates:
         mem_keywords = {
             str(k).lower()
@@ -636,23 +653,41 @@ def select_relevant_memories(
         }
         keyword_hits = len(tokens.intersection(mem_keywords)) if tokens else 0
         importance_score = _importance_score(mem.get("importance"))
-        updated_at = str(mem.get("updated_at", ""))
+        updated_at = str(mem.get("updated_at") or mem.get("created_at") or "")
         mem["_score_tuple"] = (keyword_hits, importance_score, updated_at)
 
+    # 3) 先看 keyword 是否有命中
     filtered = [
         m for m in candidates
         if m.get("_score_tuple", (0, 0, ""))[0] > 0
     ]
 
     if filtered:
-        candidates = filtered
+        # 有 keyword 命中的情况：按 keyword_hits / importance / 时间排序
+        filtered.sort(
+            key=lambda m: m.get("_score_tuple", (0, 0, "")),
+            reverse=True,
+        )
+        base_selection = filtered[:max_memories]
     else:
-        # 没有关键词命中时，可以选择：
-        # 1) 直接返回 [] —— 完全不注入记忆
-        # 2) 只选最近若干条 importance=high 的 LTM
-        candidates = []
+        # ⚠️ 没有 keyword 命中：fallback 逻辑
+        # 1) 优先选 importance = high 的
+        high_importance = [
+            m for m in candidates
+            if str(m.get("importance", "")).lower() == "high"
+        ]
+        pool = high_importance or candidates
 
-    return route_memories_with_small_model(current_text, candidates, max_memories)
+        # 2) 按更新时间倒序
+        def _ts(m: dict[str, Any]) -> str:
+            return str(m.get("updated_at") or m.get("created_at") or "")
+
+        pool_sorted = sorted(pool, key=_ts, reverse=True)
+        base_selection = pool_sorted[:max_memories]
+
+    # 4) 最终交给小模型再筛一遍（如果你不想用小模型，也可以直接返回 base_selection）
+    return route_memories_with_small_model(current_text, base_selection, max_memories)
+
 
 
 def mark_memories_active(session_id: str, mem_ids: list[str], ttl: int = 3) -> None:
@@ -739,8 +774,9 @@ def build_memories_system_message(active_memories: list[dict[str, Any]]) -> dict
     lines.append("[MEMORY CONTEXT - ASYNC, MAY BE INCOMPLETE]")
     lines.append(
         "These memories come from our past interactions, retrieved based on topic/pattern relevance. "
-        "Treat them as background context—when in doubt, trust what Reese says directly and ask if something seems off."
-        "Summaries may lose emotional texture. Preserved facts/topics, but tone may drift clinical/observational. Check live messages for actual quality of exchange."
+        "Treat them as background context—when in doubt, trust what Reese says directly and ask if something seems off. "
+        "Summaries may lose emotional texture. Preserved facts/topics, but tone may drift clinical/observational. "
+        "Check live messages for actual quality of exchange."
     )
     lines.append("")
 
@@ -770,9 +806,7 @@ def build_memories_system_message(active_memories: list[dict[str, Any]]) -> dict
                 reason_parts.append(f"keywords ≈ [{keyword_hint}]")
             reason = " and ".join(reason_parts) if reason_parts else "semantic similarity to recent messages"
 
-            lines.append(
-                f"[PINNED MEMORY #{idx} - Topic: {topic}]"
-            )
+            lines.append(f"[PINNED MEMORY #{idx} - Topic: {topic}]")
             lines.append(
                 f"From a conversation around [{date_hint}]. "
                 f"Retrieved because it relates to: {reason}."
@@ -782,10 +816,8 @@ def build_memories_system_message(active_memories: list[dict[str, Any]]) -> dict
                 "Check whether this still connects to what Reese is exploring now — it may have shifted."
             )
             lines.append("")
-            lines.append(str(mem.get("summary") or mem.get("content") or ""))
-            lines.append("")
 
-            # 只用summary + 截断长度
+            # 只写一遍截断内容
             text = str(mem.get("summary") or mem.get("content") or "")
             if len(text) > MAX_MEMORY_SUMMARY_CHARS:
                 text = text[:MAX_MEMORY_SUMMARY_CHARS] + " [TRUNCATED]"
@@ -818,10 +850,8 @@ def build_memories_system_message(active_memories: list[dict[str, Any]]) -> dict
                 "Check against what she's showing you now."
             )
             lines.append("")
-            lines.append(str(mem.get("summary") or mem.get("content") or ""))
-            lines.append("")
 
-            # ✨ 新增：同样只用 summary + 截断
+            # 同样只写一遍截断内容
             text = str(mem.get("summary") or mem.get("content") or "")
             if len(text) > MAX_MEMORY_SUMMARY_CHARS:
                 text = text[:MAX_MEMORY_SUMMARY_CHARS] + " [TRUNCATED]"
@@ -937,10 +967,10 @@ def estimate_tokens_for_messages(messages: list[dict[str, Any]]) -> int:
     # 打印一次分布
     print("DEBUG per-message lengths for context estimation:")
     for idx, role, length, snippet in debug_rows:
-        approx_tokens = length // 4  # 粗略用 1 token ≈ 4 chars
+        approx_tokens = length // 2  # 粗略用 1 token ≈ 2 chars
         print(f"  - #{idx} role={role} chars={length} ~tokens≈{approx_tokens} snippet={snippet!r}")
 
-    approx_total_tokens = total_chars // 4
+    approx_total_tokens = total_chars // 2
     print(f"DEBUG total_chars={total_chars}, approx_tokens={approx_total_tokens}")
 
     return approx_total_tokens
@@ -1462,6 +1492,39 @@ async def maybe_auto_summarize_session(settings: Settings, logical_session_id: s
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
+def _extract_stream_text(obj: dict[str, Any]) -> str:
+    """
+    从 OpenRouter / OpenAI 风格的 streaming chunk 里抽出这一步新增的文本。
+    只做最朴素的处理：优先看 choices[].delta.content，其次兜底 message.content。
+    """
+    pieces: list[str] = []
+
+    # OpenAI / OpenRouter 常见结构
+    for choice in obj.get("choices", []):
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str):
+            pieces.append(content)
+
+        # 有些提供者可能把内容塞在 message 里
+        message = choice.get("message") or {}
+        if isinstance(message, dict):
+            m_content = message.get("content")
+            if isinstance(m_content, str):
+                pieces.append(m_content)
+            elif isinstance(m_content, list):
+                # Anthropic/OpenRouter 有时是 content: [{type: "output_text", text: "..."}]
+                for block in m_content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in ("output_text", "text"):
+                        t = block.get("text")
+                        if isinstance(t, str):
+                            pieces.append(t)
+
+    return "".join(pieces)
+
+
 async def _proxy_streaming_chat_completion(
     settings: Settings,
     payload: dict[str, Any],
@@ -1472,7 +1535,7 @@ async def _proxy_streaming_chat_completion(
 ) -> StreamingResponse:
     """
     把 /v1/chat/completions 的 stream=True 请求，代理到 OpenRouter，
-    一边原样转发 SSE， 一边在服务器侧拼出完整回复，用于日志 & summarizer & pinned memories。
+    一边原样转发 SSE，一边在服务器侧拼出完整回复，用于日志 & summarizer & pinned memories。
     """
     url = f"{settings.openrouter_base_url}/v1/chat/completions"
     out_headers = {
@@ -1511,9 +1574,47 @@ async def _proxy_streaming_chat_completion(
         buffer = ""
 
         try:
+            # 这里是真正的 SSE 解析 + 转发
             async for chunk in upstream.aiter_bytes():
-                ...
+                if not chunk:
+                    continue
+
+                # 1) 原样转发给前端（Kelivo）
                 yield chunk
+
+                # 2) 自己这边解析文本，用于日志/summary
+                try:
+                    text = chunk.decode("utf-8", errors="ignore")
+                except Exception:
+                    # 解码失败就跳过，不影响 streaming
+                    continue
+
+                buffer += text
+
+                # SSE 事件以空行 \n\n 结尾，我们按这个拆事件
+                while "\n\n" in buffer:
+                    event, buffer = buffer.split("\n\n", 1)
+
+                    for line in event.splitlines():
+                        line = line.rstrip("\r")
+                        if not line.startswith("data:"):
+                            continue
+
+                        data_str = line[len("data:"):].strip()
+
+                        # OpenAI / OpenRouter 风格的结束标记
+                        if data_str == "[DONE]":
+                            continue
+
+                        try:
+                            obj = json.loads(data_str)
+                        except Exception:
+                            # 不是 JSON 就跳过
+                            continue
+
+                        chunk_text = _extract_stream_text(obj)
+                        if chunk_text:
+                            assistant_chunks.append(chunk_text)
 
         finally:
             # 先把连接关掉（不管后面要不要写日志）
@@ -1526,8 +1627,7 @@ async def _proxy_streaming_chat_completion(
             except Exception as exc:
                 print(f"DEBUG client.aclose failed: {exc!r}")
 
-            # ==== 下面是：流结束后，用拼好的文本写日志 + 起 summarizer / pin ====
-            # 没有 logical_session_id 或 raw_messages，不做任何日志相关操作，直接结束
+            # ==== 流结束后：用拼好的文本写日志 + 起 summarizer / pin ====
             if logical_session_id and isinstance(raw_messages, list):
                 full_text = "".join(assistant_chunks).strip()
                 reply_message = {
@@ -1535,43 +1635,46 @@ async def _proxy_streaming_chat_completion(
                     "content": full_text,
                 }
 
-            append_ok = False
-            try:
-                append_chat_log(
-                    settings=settings,
-                    logical_session_id=logical_session_id,
-                    request_messages=log_request_messages,
-                    reply_message=reply_message,
-                )
-                append_ok = True
-            except Exception as exc:
-                print(f"DEBUG append_chat_log (stream) failed: {exc!r}")
-
-            if append_ok:
+                append_ok = False
                 try:
-                    asyncio.create_task(
-                        maybe_auto_summarize_session(settings, logical_session_id)
+                    append_chat_log(
+                        settings=settings,
+                        logical_session_id=logical_session_id,
+                        request_messages=log_request_messages,
+                        reply_message=reply_message,
                     )
+                    append_ok = True
                 except Exception as exc:
-                    print(f"DEBUG maybe_auto_summarize_session (stream) failed: {exc!r}")
+                    print(f"DEBUG append_chat_log (stream) failed: {exc!r}")
 
-                if should_pin_from_messages(log_request_messages):
+                if append_ok:
+                    # 自动 summarizer
                     try:
                         asyncio.create_task(
-                            create_pinned_memory_from_session(
-                                settings,
-                                logical_session_id,
-                                model_name=str(request_model_name) if request_model_name else None,
-                            )
+                            maybe_auto_summarize_session(settings, logical_session_id)
                         )
                     except Exception as exc:
-                        print(f"DEBUG create_pinned_memory_from_session (stream) failed: {exc!r}")
+                        print(f"DEBUG maybe_auto_summarize_session (stream) failed: {exc!r}")
 
-                decay_active_memories(logical_session_id)
+                    # 自动 pin
+                    if should_pin_from_messages(log_request_messages):
+                        try:
+                            asyncio.create_task(
+                                create_pinned_memory_from_session(
+                                    settings,
+                                    logical_session_id,
+                                    model_name=str(request_model_name) if request_model_name else None,
+                                )
+                            )
+                        except Exception as exc:
+                            print(f"DEBUG create_pinned_memory_from_session (stream) failed: {exc!r}")
 
+                    # active_memories 的衰减
+                    decay_active_memories(logical_session_id)
 
     # Kelivo 端预期的是 OpenAI 风格 SSE，所以这里 media_type 设成 text/event-stream
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 
 
@@ -1619,42 +1722,28 @@ async def chat_completions(request: Request) -> Any:
     request_model_name = payload.get("model")
 
     system_messages: list[dict[str, Any]] = []
+    summary_obj = None
     if logical_session_id:
         summary_obj = load_session_summary(settings, logical_session_id)
+
     if isinstance(summary_obj, dict):
-        # 1) narrative summary（原来的那段）
+        # narrative summary
         summary_text = str(summary_obj.get("summary", ""))
 
-        # 2) 把其它结构化字段一起拼成一个 block
-        #    这里用 json.dumps 只是为了让主模型能“看见结构”。
-        #    如果你更想给它自然语言 bullet，也可以再往下细化。
-        structured_part = json.dumps(
-            {
-                "active_threads": summary_obj.get("active_threads", []),
-                "session_facts": summary_obj.get("session_facts", []),
-                "pattern_candidates": summary_obj.get("pattern_candidates", []),
-                "relational_state": summary_obj.get("relational_state", {}),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-        # 3) 最终注入的 system message
-        system_messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "[SESSION SUMMARY - ASYNC, MAY BE INCOMPLETE]\n"
-                    "This is a rolling summary from earlier in our conversation. It's generated asynchronously and may not include everything. "
-                    "Summaries may lose emotional texture. Preserved facts/topics, but tone may drift clinical/observational. Check live messages for actual quality of exchange."
-                    "When in doubt, trust what Reese says directly over what's summarized here, and feel free to ask if something feels unclear or contradictory.\n\n"
-                    "NARRATIVE SUMMARY:\n"
-                    f"{summary_text}\n\n"
-                    "STRUCTURED SUMMARY (JSON, FOR YOUR REFERENCE):\n"
-                    f"{structured_part}"
-                ),
-            }
-        )
+        if summary_text:
+            # 最终注入的 system message
+            system_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[SESSION SUMMARY - ASYNC, MAY BE INCOMPLETE]\n"
+                        "This is a rolling summary from earlier in our conversation. It's generated asynchronously and may not include everything. "
+                        "Summaries may lose emotional texture. Preserved facts/topics, but tone may drift clinical/observational. Check live messages for actual quality of exchange."
+                        "When in doubt, trust what Reese says directly over what's summarized here, and feel free to ask if something feels unclear or contradictory.\n\n"
+                        + summary_text
+                    ),
+                }
+            )
 
         current_text = extract_recent_user_text(history_messages, max_messages=2)
         candidate_memories = select_relevant_memories(

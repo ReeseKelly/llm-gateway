@@ -1,5 +1,7 @@
 import os
 from dataclasses import dataclass
+from functools import lru_cache
+
 
 from dotenv import load_dotenv
 
@@ -17,6 +19,13 @@ class Settings:
     summary_max_turns: int = 40
     summary_store_path: str = "session_summaries.json"
 
+    # tg
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_target_chat_id: str = os.getenv("TELEGRAM_TARGET_CHAT_ID", "")
+    gateway_base_url: str = os.getenv("GATEWAY_BASE_URL", "https://llm-gateway-sser.onrender.com")
+    telegram_default_model: str = os.getenv("TELEGRAM_DEFAULT_MODEL", "anthropic/claude-sonnet-4.5")
+
+
     context_max_tokens: int = 9000
     context_keep_last_user_messages: int = 4
     context_keep_last_assistant_messages: int = 4
@@ -27,6 +36,9 @@ class Settings:
     memory_consolidation_min_count: int = 3
     memory_consolidation_model: str = ""
 
+@lru_cache
+def get_settings() -> Settings:
+     return Settings()
 
 def _safe_int(value: str | None, default: int) -> int:
     if not value:
