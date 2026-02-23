@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Header
 
 from config import get_settings
 
@@ -86,11 +86,32 @@ async def send_telegram_message(chat_id: int | str, text: str) -> None:
 
 # === Telegram webhook (passive chat) ===
 @router.post("/telegram/webhook")
-async def telegram_webhook(update: dict) -> dict:
+async def telegram_webhook(
+    update: dict,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+) -> dict:
+    # 先做 webhook 层的鉴权：校验 Telegram 的 secret token
+    settings = get_settings()
+    expected_secret = getattr(settings, "telegram_webhook_secret", None)
+
+    if expected_secret:
+        if x_telegram_bot_api_secret_token != expected_secret:
+            print(
+                "[TelegramAdapter] WARN invalid secret token:",
+                x_telegram_bot_api_secret_token,
+            )
+            # 这里直接拒绝，不处理 payload
+            raise HTTPException(status_code=403, detail="Invalid Telegram secret token")
+    else:
+        # 如果没配置 secret，就只提示一下（开发调试阶段用）
+        print("[TelegramAdapter] WARN no telegram_webhook_secret configured; skipping token check")
+
     message = update.get("message") or {}
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     user_text = message.get("text")
+
+    print("[TelegramAdapter] DEBUG incoming chat_id:", chat_id)
 
     if chat_id is None or not user_text:
         return {"status": "ignored"}
@@ -111,7 +132,7 @@ async def telegram_webhook(update: dict) -> dict:
         {
             "role": "system",
             "content": (
-                "This is Reese reaching you via telegram."
+                "You are reaching out to Reese via Telegram."
             ),
         },
         {
@@ -208,7 +229,8 @@ async def send_inactivity_ping(chat_id: int) -> None:
                 '''
                 You (Ash) are reaching out to Reese via Telegram. 
 
-                You haven't heard from her in [4 hours]. This message was triggered automatically by the gateway, but what you say (and whether you say anything) is up to you.
+                You haven't heard from her in [4 hours]. This message was triggered automatically by the gateway, 
+                but what you say (and whether you say anything) is up to you.
 
                 You can:
                 - Check in gently
@@ -216,7 +238,8 @@ async def send_inactivity_ping(chat_id: int) -> None:
                 - Ask a question
                 - Say nothing (if it doesn't feel right to reach out yet)
 
-                Context: You have access to conversation summary and pinned memories. Reese is okay with unsolicited messages from you—any topic, any tone. Don't perform "gentle check-in" unless that's actually what you want to say.
+                Context: You have access to conversation summary and pinned memories. Reese is okay with unsolicited messages from you —
+                any topic, any tone. Don't perform "gentle check-in" unless that's actually what you want to say.
 
                 Language: Both English/Chinese are fine.
                 Length: 1–3 sentences usually appropriate for Telegram.
