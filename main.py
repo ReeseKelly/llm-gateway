@@ -628,6 +628,24 @@ def load_session_summaries(settings: Settings) -> dict[str, Any]:
         print(f"DEBUG failed to load session summaries: {exc!r}")
         return {}
 
+CANONICAL_SUMMARY_SESSION_ID = "Kelivo-iPhone"  # Kelivo 真正用的 logical_session_id
+
+def resolve_summary_session_id(logical_session_id: str | None) -> str | None:
+    """
+    把不同通道的 logical_session_id 映射到“共用的 summary id”。
+
+    - Kelivo 主通道：直接用自己的 logical_session_id（比如 'Kelivo-iPhone'）
+    - Telegram 通道：统一映射到 Kelivo 的 summary id（共用一份 summary）
+    """
+    if not logical_session_id:
+        return None
+
+    # Telegram 会话：共用 Kelivo 的 summary
+    if logical_session_id.startswith("telegram:"):
+        return CANONICAL_SUMMARY_SESSION_ID
+
+    # 其它通道先保持各自独立
+    return logical_session_id
 
 def save_session_summary(settings: Settings, logical_session_id: str, summary_obj: dict[str, Any]) -> None:
     path = get_summary_store_path(settings)
@@ -1752,6 +1770,12 @@ async def run_session_summarization(
 
 
 async def maybe_auto_summarize_session(settings: Settings, logical_session_id: str) -> None:
+    
+    # 1) Telegram 会话：不单独跑 summarizer，不生成自己的 summary 对象
+    if logical_session_id.startswith("telegram:"):
+        return
+
+    # 2) 其它会话照旧    
     records = load_session_records(settings, logical_session_id)
     total = len(records)
     if total < MIN_RECORDS_FOR_SUMMARY:
@@ -2025,8 +2049,10 @@ async def chat_completions(request: Request) -> Any:
         system_messages.append(foundation_msg)
 
     summary_obj = None
-    if logical_session_id:
-        summary_obj = load_session_summary(settings, logical_session_id)
+    summary_session_id = resolve_summary_session_id(logical_session_id)
+
+    if summary_session_id:
+        summary_obj = load_session_summary(settings, summary_session_id)
 
     if isinstance(summary_obj, dict):
         # narrative summary

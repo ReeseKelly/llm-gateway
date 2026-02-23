@@ -116,6 +116,24 @@ async def telegram_webhook(
     if chat_id is None or not user_text:
         return {"status": "ignored"}
     
+    allowed_ids: set[int] = set()
+    if settings.telegram_target_chat_id:
+        try:
+            allowed_ids.add(int(settings.telegram_target_chat_id))
+        except ValueError:
+            print(
+                "[TelegramAdapter] WARN invalid TELEGRAM_TARGET_CHAT_ID in settings:",
+                repr(settings.telegram_target_chat_id),
+            )
+
+    if allowed_ids and chat_id not in allowed_ids:
+        # 这里你可以选择静默丢弃，或者温柔解释
+        await send_telegram_message(
+            chat_id,
+            "sorry, the number you have dialed..."
+        )
+        return {"status": "forbidden"}
+    
     # === 更新最近用户活动时间 ===
     now = datetime.utcnow()
     rec = activity_state.get(chat_id)
