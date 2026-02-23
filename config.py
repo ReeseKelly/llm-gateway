@@ -31,7 +31,9 @@ class Settings(BaseSettings):
         "TELEGRAM_DEFAULT_MODEL", "anthropic/claude-sonnet-4.5"
     )
 
-    context_max_tokens: int = 3500
+    telegram_webhook_secret: str = "changeme-super-secret"
+
+    context_max_tokens: int = 8000
     context_keep_last_user_messages: int = 4
     context_keep_last_assistant_messages: int = 4
 
@@ -54,7 +56,7 @@ def get_settings() -> Settings:
         outbound_proxy_url=os.getenv("OUTBOUND_PROXY_URL"),
         summary_model=os.getenv("SUMMARY_MODEL", "deepseek/deepseek-v3.2"),
         summary_max_turns=_safe_int(os.getenv("SUMMARY_MAX_TURNS"), 40),
-        context_max_tokens=_safe_int(os.getenv("CONTEXT_MAX_TOKENS"), 3500),
+        context_max_tokens=_safe_int(os.getenv("CONTEXT_MAX_TOKENS"), 8000),
         context_keep_last_user_messages=_safe_int(
             os.getenv("CONTEXT_KEEP_LAST_USER_MESSAGES"), 4
         ),
