@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     )
 
     telegram_webhook_secret: str = "changeme-super-secret"
+    shared_session_id: str | None = None
 
     context_max_tokens: int = 8000
     context_keep_last_user_messages: int = 4
@@ -43,6 +44,21 @@ class Settings(BaseSettings):
     memory_consolidation_min_count: int = 3
     memory_consolidation_model: str = ""
 
+    caldav_url: str = ""
+    caldav_username: str = ""
+    caldav_password: str = ""
+    caldav_principal: str | None = None
+    caldav_calendar_name: str | None = None
+
+    health_provider: str = "file"
+    health_data_path: str = "/data/health.json"
+
+    timezone: str = "Asia/Shanghai"
+
+    weather_api_url: str = ""
+    weather_api_key: str | None = None
+    weather_default_location: str = ""
+    weather_units: str = "metric"
 
 @lru_cache
 def get_settings() -> Settings:
@@ -72,6 +88,19 @@ def get_settings() -> Settings:
             os.getenv("MEMORY_CONSOLIDATION_MIN_COUNT"), 3
         ),
         memory_consolidation_model=os.getenv("MEMORY_CONSOLIDATION_MODEL", ""),
+        shared_session_id=os.getenv("SHARED_SESSION_ID") or None,
+        caldav_url=os.getenv("CALDAV_URL", ""),
+        caldav_username=os.getenv("CALDAV_USERNAME", ""),
+        caldav_password=os.getenv("CALDAV_PASSWORD", ""),
+        caldav_principal=os.getenv("CALDAV_PRINCIPAL") or None,
+        caldav_calendar_name=os.getenv("CALDAV_CALENDAR_NAME") or None,
+        health_provider=os.getenv("HEALTH_PROVIDER", "file"),
+        health_data_path=os.getenv("HEALTH_DATA_PATH", "/data/health.json"),
+        timezone=os.getenv("TIMEZONE", "Asia/Shanghai"),
+        weather_api_url=os.getenv("WEATHER_API_URL", ""),
+        weather_api_key=os.getenv("WEATHER_API_KEY") or None,
+        weather_default_location=os.getenv("WEATHER_DEFAULT_LOCATION", ""),
+        weather_units=os.getenv("WEATHER_UNITS", "metric"),
     )
 
 

@@ -14,6 +14,10 @@ from httpx_socks import AsyncProxyTransport
 from fastapi.responses import StreamingResponse
 
 from config import Settings, get_settings
+
+from calendar_tools import CALENDAR_TOOLS, build_calendar_tool_message
+from health_tools import HEALTH_TOOLS, build_health_tool_message
+
 from memories import (
     add_ltm_memory,
     add_pinned_memory,
@@ -22,6 +26,8 @@ from memories import (
     load_ltm_memories,
     load_pinned_memories,
 )
+
+from weather_tools import WEATHER_TOOLS, build_weather_tool_message
 
 from telegram_adapter import router as telegram_router, init_telegram
 
@@ -628,24 +634,26 @@ def load_session_summaries(settings: Settings) -> dict[str, Any]:
         print(f"DEBUG failed to load session summaries: {exc!r}")
         return {}
 
-CANONICAL_SUMMARY_SESSION_ID = "Kelivo-iPhone"  # Kelivo 真正用的 logical_session_id
+CANONICAL_SUMMARY_SESSION_ID = "Kelivo-iPhone"  # fallback
 
-def resolve_summary_session_id(logical_session_id: str | None) -> str | None:
-    """
-    把不同通道的 logical_session_id 映射到“共用的 summary id”。
-
-    - Kelivo 主通道：直接用自己的 logical_session_id（比如 'Kelivo-iPhone'）
-    - Telegram 通道：统一映射到 Kelivo 的 summary id（共用一份 summary）
-    """
+def resolve_shared_session_id(settings: Settings, logical_session_id: str | None) -> str | None:
     if not logical_session_id:
         return None
 
-    # Telegram 会话：共用 Kelivo 的 summary
+    if settings.shared_session_id:
+        return settings.shared_session_id
+
     if logical_session_id.startswith("telegram:"):
         return CANONICAL_SUMMARY_SESSION_ID
-
-    # 其它通道先保持各自独立
+    
     return logical_session_id
+
+def resolve_summary_session_id(settings: Settings, logical_session_id: str | None) -> str | None:
+    """
+    把不同通道的 logical_session_id 映射到“共用的 summary id”。
+    优先使用 SHARED_SESSION_ID。
+    """
+    return resolve_shared_session_id(settings, logical_session_id)
 
 def save_session_summary(settings: Settings, logical_session_id: str, summary_obj: dict[str, Any]) -> None:
     path = get_summary_store_path(settings)
@@ -1840,6 +1848,45 @@ def _extract_stream_text(obj: dict[str, Any]) -> str:
 
     return "".join(pieces)
 
+EXTRA_TOOL_NAMES = {"calendar_query", "calendar_create", "health_query", "weather_query"}
+
+
+def merge_gateway_tools(incoming_tools: Any) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    if isinstance(incoming_tools, list):
+        merged.extend(incoming_tools)
+
+    existing_names: set[str] = set()
+    for tool in merged:
+        if not isinstance(tool, dict):
+            continue
+        func = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = func.get("name") or tool.get("name")
+        if isinstance(name, str):
+            existing_names.add(name)
+
+    for tool in (CALENDAR_TOOLS + HEALTH_TOOLS + WEATHER_TOOLS):
+        func = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = func.get("name")
+        if isinstance(name, str) and name in existing_names:
+            continue
+        merged.append(tool)
+    return merged
+
+
+async def build_extra_tool_message(tool_call: dict[str, Any]) -> dict[str, Any] | None:
+    tool_call_id = str(tool_call.get("id") or "")
+    function_obj = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    tool_name = str(function_obj.get("name") or "")
+    arguments_json = str(function_obj.get("arguments") or "{}")
+
+    if tool_name in {"calendar_query", "calendar_create"}:
+        return build_calendar_tool_message(tool_call_id, tool_name, arguments_json)
+    if tool_name == "health_query":
+        return build_health_tool_message(tool_call_id, tool_name, arguments_json)
+    if tool_name == "weather_query":
+        return await build_weather_tool_message(tool_call_id, tool_name, arguments_json)
+    return None
 
 async def _proxy_streaming_chat_completion(
     settings: Settings,
@@ -2016,6 +2063,8 @@ async def chat_completions(request: Request) -> Any:
     headers = request.headers
     logical_session_id = headers.get("x-logical-session-id") or payload.get("logical_session_id")
 
+    logical_session_id = resolve_shared_session_id(settings, logical_session_id)
+
     raw_messages = payload.get("messages")
     history_messages = raw_messages if isinstance(raw_messages, list) else []
 
@@ -2030,6 +2079,7 @@ async def chat_completions(request: Request) -> Any:
             for t in tools
         ])
 
+    payload["tools"] = merge_gateway_tools(tools)
 
     # 先清理 Kelivo 的自动 Memory Tool 等注入段
     if isinstance(history_messages, list):
@@ -2049,7 +2099,7 @@ async def chat_completions(request: Request) -> Any:
         system_messages.append(foundation_msg)
 
     summary_obj = None
-    summary_session_id = resolve_summary_session_id(logical_session_id)
+    summary_session_id = resolve_summary_session_id(settings, logical_session_id)
 
     if summary_session_id:
         summary_obj = load_session_summary(settings, summary_session_id)
@@ -2172,6 +2222,56 @@ async def chat_completions(request: Request) -> Any:
 
     if isinstance(response_data, dict):
         debug_cache_usage("non-stream", response_data)
+
+            # 附加工具调用：只处理本次新增的 calendar/health/weather，原有工具保持上游行为
+    try:
+        while True:
+            if not isinstance(response_data, dict):
+                break
+            choices = response_data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                break
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            message_obj = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
+            tool_calls = message_obj.get("tool_calls") if isinstance(message_obj.get("tool_calls"), list) else []
+            if not tool_calls:
+                break
+
+            matched = False
+            tool_messages: list[dict[str, Any]] = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                function_obj = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                tool_name = function_obj.get("name")
+                if not isinstance(tool_name, str) or tool_name not in EXTRA_TOOL_NAMES:
+                    continue
+                built = await build_extra_tool_message(tc)
+                if built is not None:
+                    matched = True
+                    tool_messages.append(built)
+
+            if not matched:
+                break
+
+            base_messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+            payload["messages"] = [*base_messages, message_obj, *tool_messages]
+            async with httpx.AsyncClient(**build_httpx_client_kwargs(settings)) as client:
+                follow_response = await client.post(url, json=payload, headers=out_headers)
+            if follow_response.status_code >= 400:
+                print(
+                    f"DEBUG OpenRouter returned error after tool call: "
+                    f"{follow_response.status_code} {follow_response.text[:200]!r}"
+                )
+                raise HTTPException(status_code=follow_response.status_code, detail=follow_response.text)
+            response_data = follow_response.json()
+            if isinstance(response_data, dict):
+                debug_cache_usage("non-stream-tool", response_data)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"DEBUG extra tool handling failed: {exc!r}")
+
 
     append_ok = False
     if logical_session_id and isinstance(raw_messages, list):

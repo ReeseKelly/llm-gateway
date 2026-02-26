@@ -33,6 +33,13 @@ router = APIRouter()
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 
 
+def resolve_telegram_logical_session_id(chat_id: int | str) -> str:
+    settings = get_settings()
+    if settings.shared_session_id:
+        return settings.shared_session_id
+    return f"telegram:{chat_id}"
+
+
 # === Gateway call helper ===
 async def call_gateway_chat_completions(
     logical_session_id: str | None,
@@ -145,7 +152,7 @@ async def telegram_webhook(
         rec.last_ping_ts = None
     # ===========================
 
-    logical_session_id = f"telegram:{chat_id}"
+    logical_session_id = resolve_telegram_logical_session_id(chat_id)
     messages = [
         {
             "role": "system",
@@ -190,7 +197,7 @@ async def send_daily_good_morning() -> None:
         return
 
     target_chat_id = settings.telegram_target_chat_id
-    logical_session_id = f"telegram:{target_chat_id}"
+    logical_session_id = resolve_telegram_logical_session_id(target_chat_id)
     messages = [
         {
             "role": "system",
@@ -238,7 +245,7 @@ CHECK_INTERVAL_MINUTES = 30   # 多久检查一次
 
 async def send_inactivity_ping(chat_id: int) -> None:
     """给长时间没说话的 chat 发送一条轻微的关心消息。"""
-    logical_session_id = f"telegram:{chat_id}"
+    logical_session_id = resolve_telegram_logical_session_id(chat_id)
 
     messages = [
         {

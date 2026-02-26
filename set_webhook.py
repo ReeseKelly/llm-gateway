@@ -1,11 +1,11 @@
 import asyncio
 import httpx
 
-TELEGRAM_BOT_TOKEN = "8509028841:AAHSlEPm9O762PeIHUd6m8R9sSSFonp77as"  
-GATEWAY_URL = "https://llm-gateway-sser.onrender.com/telegram/webhook"
+TELEGRAM_BOT_TOKEN = "8219238737:AAHjrVTXnGis1_0R4jfR8q0bOoReh2n0QuY"  
+GATEWAY_URL = "https://llm-gateway-sser.onrender.com/telegram/webhook&secret_token=changeme-super-secret"
 
 async def main():
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook&secret_token=changeme-telegram-super-secret"
     payload = {
         "url": GATEWAY_URL,
     }
