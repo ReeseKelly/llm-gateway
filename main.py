@@ -7,6 +7,9 @@ from pathlib import Path
 import re
 from typing import Any
 
+import logging
+logger = logging.getLogger(__name__)
+
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Request
 from httpx_socks import AsyncProxyTransport
@@ -16,6 +19,7 @@ from fastapi.responses import StreamingResponse
 from config import Settings, get_settings
 
 from calendar_tools import CALENDAR_TOOLS, build_calendar_tool_message
+from health_client import SUPPORTED_HEALTH_METRICS, get_health_provider, parse_health_record
 from health_tools import HEALTH_TOOLS, build_health_tool_message
 
 from memories import (
@@ -637,15 +641,24 @@ def load_session_summaries(settings: Settings) -> dict[str, Any]:
 CANONICAL_SUMMARY_SESSION_ID = "Kelivo-iPhone"  # fallback
 
 def resolve_shared_session_id(settings: Settings, logical_session_id: str | None) -> str | None:
+    
+    raw = logical_session_id
+
     if not logical_session_id:
+        logger.debug("resolve_shared_session_id: raw=None -> shared=None ")
         return None
 
     if settings.shared_session_id:
-        return settings.shared_session_id
+        shared =  settings.shared_session_id
+        logger.debug("resolve_shared_session_id: raw=%r -> shared=%r (from SHARED_SESSION_ID)", raw, shared)
+        return shared
 
     if logical_session_id.startswith("telegram:"):
-        return CANONICAL_SUMMARY_SESSION_ID
+        shared = CANONICAL_SUMMARY_SESSION_ID
+        logger.debug("resolve_shared_session_id: raw=%r -> shared=%r (telegram canonical)", raw, shared)
+        return shared
     
+    logger.debug("resolve_shared_session_id: raw=%r -> shared=%r (no mapping)", raw, raw)
     return logical_session_id
 
 def resolve_summary_session_id(settings: Settings, logical_session_id: str | None) -> str | None:
@@ -1848,7 +1861,7 @@ def _extract_stream_text(obj: dict[str, Any]) -> str:
 
     return "".join(pieces)
 
-EXTRA_TOOL_NAMES = {"calendar_query", "calendar_create", "health_query", "weather_query"}
+EXTRA_TOOL_NAMES = {"calendar_query", "calendar_create", "health_log", "health_query", "weather_query"}
 
 
 def merge_gateway_tools(incoming_tools: Any) -> list[dict[str, Any]]:
@@ -2061,6 +2074,12 @@ async def chat_completions(request: Request) -> Any:
 
     settings = get_settings()
     headers = request.headers
+    
+    expected_gateway_api_key = (settings.gateway_api_key or "").strip()
+    if expected_gateway_api_key:
+        incoming_gateway_api_key = headers.get("X-Gateway-API-Key") or headers.get("x-gateway-api-key")
+        if incoming_gateway_api_key != expected_gateway_api_key:
+            raise HTTPException(status_code=401, detail="Unauthorized")
     logical_session_id = headers.get("x-logical-session-id") or payload.get("logical_session_id")
 
     logical_session_id = resolve_shared_session_id(settings, logical_session_id)
@@ -2313,6 +2332,32 @@ async def chat_completions(request: Request) -> Any:
     print(f"DEBUG summary_model = {settings.summary_model!r}")
     return response_data
 
+@app.post("/health/webhook/apple")
+async def health_webhook_apple(payload: dict[str, Any] = Body(...)) -> Any:
+    settings = get_settings()
+    expected_token = (settings.health_webhook_token or "").strip()
+    incoming_token = str(payload.get("token") or "").strip()
+
+    if not expected_token or incoming_token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid webhook token")
+
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise HTTPException(status_code=400, detail="records must be a list")
+
+    parsed = [parse_health_record(rec) for rec in records if isinstance(rec, dict)]
+    clean = [rec for rec in parsed if rec is not None]
+
+    provider = get_health_provider()
+    written = provider.append_records(clean)
+    metric_names = sorted({rec.metric for rec in clean if rec.metric in SUPPORTED_HEALTH_METRICS})
+
+    print(
+        f"DEBUG health webhook apple accepted: incoming={len(records)}, "
+        f"written={written}, metrics={metric_names}"
+    )
+
+    return {"ok": True, "incoming": len(records), "written": written, "metrics": metric_names}
 
 
 @app.post("/internal/list_pinned_memories")

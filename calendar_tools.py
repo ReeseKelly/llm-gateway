@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import logging
 from typing import Any
 
 from caldav_client import CalDAVCalendarClient, CalendarEvent
+
+logger = logging.getLogger(__name__)
 
 CALENDAR_TOOLS: list[dict[str, Any]] = [
     {
@@ -62,11 +65,14 @@ def _event_to_dict(event: CalendarEvent) -> dict[str, Any]:
 def execute_calendar_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         client = CalDAVCalendarClient()
+
         if tool_name == "calendar_query":
             start = _parse_iso_datetime(str(arguments["start"]))
             end = _parse_iso_datetime(str(arguments["end"]))
             events = client.list_events(start=start, end=end)
+            logger.info("calendar_query count=%s start=%s end=%s", len(events), start.isoformat(), end.isoformat())
             return {"ok": True, "events": [_event_to_dict(e) for e in events]}
+
         if tool_name == "calendar_create":
             start = _parse_iso_datetime(str(arguments["start"]))
             end = _parse_iso_datetime(str(arguments["end"]))
@@ -76,17 +82,15 @@ def execute_calendar_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str
                 summary=str(arguments["summary"]),
                 description=str(arguments.get("description")) if arguments.get("description") else None,
             )
+            logger.info("calendar_create start=%s end=%s", start.isoformat(), end.isoformat())
             return {"ok": True, "event": _event_to_dict(event)}
+
         return {"ok": False, "error": f"unsupported tool: {tool_name}"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
 
-def build_calendar_tool_message(
-    tool_call_id: str,
-    tool_name: str,
-    arguments_json: str,
-) -> dict[str, Any]:
+def build_calendar_tool_message(tool_call_id: str, tool_name: str, arguments_json: str) -> dict[str, Any]:
     try:
         arguments = json.loads(arguments_json) if arguments_json else {}
         if not isinstance(arguments, dict):
