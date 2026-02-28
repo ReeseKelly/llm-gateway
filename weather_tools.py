@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 from typing import Any
 
 import httpx
 
 from config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 WEATHER_TOOLS: list[dict[str, Any]] = [
@@ -180,7 +183,10 @@ async def execute_weather_tool(tool_name: str, arguments: dict[str, Any]) -> dic
             units=settings.weather_units,
         )
         data = await client.fetch(location=location, days=days)
-        return _normalize_weather_payload(data, location)
+        payload = _normalize_weather_payload(data, location)
+        logger.info("TOOL weather_query location=%s days=%s ok=%s", location, days, bool(payload.get("ok")))
+        print(f"TOOL weather_query location={location!r} days={days} ok={bool(payload.get('ok'))}")
+        return payload
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 

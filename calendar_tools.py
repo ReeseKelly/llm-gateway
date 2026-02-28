@@ -70,7 +70,8 @@ def execute_calendar_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str
             start = _parse_iso_datetime(str(arguments["start"]))
             end = _parse_iso_datetime(str(arguments["end"]))
             events = client.list_events(start=start, end=end)
-            logger.info("calendar_query count=%s start=%s end=%s", len(events), start.isoformat(), end.isoformat())
+            logger.info("TOOL calendar_query start=%s end=%s count=%s", start.isoformat(), end.isoformat(), len(events))
+            print(f"TOOL calendar_query start={start.isoformat()} end={end.isoformat()} count={len(events)}")
             return {"ok": True, "events": [_event_to_dict(e) for e in events]}
 
         if tool_name == "calendar_create":
@@ -82,7 +83,9 @@ def execute_calendar_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str
                 summary=str(arguments["summary"]),
                 description=str(arguments.get("description")) if arguments.get("description") else None,
             )
-            logger.info("calendar_create start=%s end=%s", start.isoformat(), end.isoformat())
+            ok = bool(event.id)
+            logger.info("TOOL calendar_create summary=%s start=%s end=%s ok=%s", str(arguments.get("summary", ""))[:80], start.isoformat(), end.isoformat(), ok)
+            print(f"TOOL calendar_create summary={str(arguments.get('summary', ''))[:80]!r} start={start.isoformat()} end={end.isoformat()} ok={ok}")
             return {"ok": True, "event": _event_to_dict(event)}
 
         return {"ok": False, "error": f"unsupported tool: {tool_name}"}

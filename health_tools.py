@@ -120,7 +120,8 @@ def execute_health_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, 
 
             written = provider.append_records(clean)
             metric_names = sorted({r.metric for r in clean})
-            logger.info("health_log metrics=%s records=%s", metric_names, written)
+            logger.info("TOOL health_log written=%s metrics=%s", written, metric_names)
+            print(f"TOOL health_log written={written} metrics={metric_names}")
             return {"ok": True, "written": written, "metrics": metric_names}
 
         if tool_name == "health_query":
@@ -148,7 +149,8 @@ def execute_health_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, 
                 payload_metrics = dict(grouped)
 
             total_points = sum(len(v) for v in payload_metrics.values())
-            logger.info("health_query metrics=%s total_points=%s", list(payload_metrics.keys()), total_points)
+            logger.info("TOOL health_query metrics=%s from=%s to=%s ok=%s total_points=%s", list(payload_metrics.keys()), start.isoformat() if start else None, end.isoformat() if end else None, True, total_points)
+            print(f"TOOL health_query metrics={list(payload_metrics.keys())} from={start.isoformat() if start else None} to={end.isoformat() if end else None} ok=True total_points={total_points}")
 
             return {
                 "ok": True,
