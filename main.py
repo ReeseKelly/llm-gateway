@@ -18,9 +18,9 @@ from fastapi.responses import StreamingResponse
 
 from config import Settings, get_settings
 
-from calendar_tools import CALENDAR_TOOLS, build_calendar_tool_message
+from calendar_tools import CALENDAR_TOOLS, execute_calendar_tool
 from health_client import SUPPORTED_HEALTH_METRICS, get_health_provider, parse_health_record
-from health_tools import HEALTH_TOOLS, build_health_tool_message
+from health_tools import HEALTH_TOOLS, execute_health_tool
 
 from memories import (
     add_ltm_memory,
@@ -31,9 +31,9 @@ from memories import (
     load_pinned_memories,
 )
 
-from weather_tools import WEATHER_TOOLS, build_weather_tool_message
-from memory_v2 import MEMORY_TOOLS, build_memory_tool_message
-from task_engine import TASK_TOOLS, build_task_tool_message
+from weather_tools import WEATHER_TOOLS, execute_weather_tool
+from memory_v2 import MEMORY_TOOLS, execute_memory_tool
+from task_engine import TASK_TOOLS, execute_task_tool
 
 from telegram_adapter import router as telegram_router, init_telegram
 
@@ -1895,16 +1895,6 @@ def _extract_stream_text(obj: dict[str, Any]) -> str:
 
     return "".join(pieces)
 
-EXTRA_TOOL_NAMES = {
-    "calendar_query", "calendar_create",
-    "health_log", "health_query",
-    "weather_query",
-    "note_create", "note_list", "note_delete",
-    "midterm_upsert", "midterm_list", "midterm_mark_promoted",
-    "ltm_register_topic", "ltm_search",
-    "task_schedule_ping",
-}
-
 
 def merge_gateway_tools(incoming_tools: Any) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
@@ -1920,7 +1910,7 @@ def merge_gateway_tools(incoming_tools: Any) -> list[dict[str, Any]]:
         if isinstance(name, str):
             existing_names.add(name)
 
-    for tool in (CALENDAR_TOOLS + HEALTH_TOOLS + WEATHER_TOOLS):
+    for tool in (CALENDAR_TOOLS + HEALTH_TOOLS + WEATHER_TOOLS + MEMORY_TOOLS + TASK_TOOLS):
         func = tool.get("function") if isinstance(tool.get("function"), dict) else {}
         name = func.get("name")
         if isinstance(name, str) and name in existing_names:
@@ -1929,19 +1919,89 @@ def merge_gateway_tools(incoming_tools: Any) -> list[dict[str, Any]]:
     return merged
 
 
-async def build_extra_tool_message(tool_call: dict[str, Any]) -> dict[str, Any] | None:
+def _safe_truncate(value: Any, limit: int = 200) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _parse_tool_arguments(arguments_raw: Any) -> dict[str, Any]:
+    if isinstance(arguments_raw, dict):
+        return arguments_raw
+    if isinstance(arguments_raw, str):
+        try:
+            parsed = json.loads(arguments_raw) if arguments_raw else {}
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def dispatch_local_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    settings: Settings,
+    history_session_id: str | None,
+    telegram_chat_id: str | None,
+) -> dict[str, Any]:
+    if tool_name.startswith("calendar_"):
+        return execute_calendar_tool(tool_name, arguments)
+
+    if tool_name.startswith("health_"):
+        return execute_health_tool(tool_name, arguments)
+
+    if tool_name.startswith("weather_"):
+        return await execute_weather_tool(tool_name, arguments)
+
+    if tool_name.startswith("note_") or tool_name.startswith("midterm_") or tool_name.startswith("ltm_"):
+        return execute_memory_tool(
+            tool_name,
+            arguments,
+            settings=settings,
+            shared_session_id=history_session_id,
+        )
+
+    if tool_name.startswith("task_"):
+        return execute_task_tool(
+            tool_name,
+            arguments,
+            settings=settings,
+            telegram_chat_id=telegram_chat_id,
+        )
+
+    logger.warning("Unknown local tool: %s", tool_name)
+    return {"ok": False, "error": f"Unknown local tool: {tool_name}"}
+
+
+async def build_local_tool_message(
+    tool_call: dict[str, Any],
+    *,
+    settings: Settings,
+    history_session_id: str | None,
+    telegram_chat_id: str | None,
+) -> dict[str, Any]:
     tool_call_id = str(tool_call.get("id") or "")
     function_obj = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
     tool_name = str(function_obj.get("name") or "")
-    arguments_json = str(function_obj.get("arguments") or "{}")
+    arguments = _parse_tool_arguments(function_obj.get("arguments"))
 
-    if tool_name in {"calendar_query", "calendar_create"}:
-        return build_calendar_tool_message(tool_call_id, tool_name, arguments_json)
-    if tool_name == "health_query":
-        return build_health_tool_message(tool_call_id, tool_name, arguments_json)
-    if tool_name == "weather_query":
-        return await build_weather_tool_message(tool_call_id, tool_name, arguments_json)
-    return None
+    payload = await dispatch_local_tool(
+        tool_name,
+        arguments,
+        settings=settings,
+        history_session_id=history_session_id,
+        telegram_chat_id=telegram_chat_id,
+    )
+    logger.info("TOOL %s args=%s ok=%s", tool_name, _safe_truncate(arguments, 200), payload.get("ok"))
+
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "name": tool_name,
+        "content": json.dumps(payload, ensure_ascii=False),
+    }
 
 async def _proxy_streaming_chat_completion(
     settings: Settings,
@@ -2164,8 +2224,7 @@ async def chat_completions(request: Request) -> Any:
         ])
 
     client_tools = tools if isinstance(tools, list) else []
-    gateway_tools = CALENDAR_TOOLS + HEALTH_TOOLS + WEATHER_TOOLS
-    payload["tools"] = [*client_tools, *gateway_tools]
+    payload["tools"] = merge_gateway_tools(client_tools)
 
     tool_names: list[str] = []
     for t in payload.get("tools") or []:
@@ -2292,6 +2351,8 @@ async def chat_completions(request: Request) -> Any:
         # ===== 流式分支：直接交给 _proxy_streaming_chat_completion =====
     if stream_flag:
         # NOTE: streaming path currently only proxies upstream output and does not execute local tools.
+        if payload.get("tools"):
+            logger.warning("stream=true with tools configured; local tool execution is disabled in streaming mode")
         return await _proxy_streaming_chat_completion(
             settings=settings,
             payload=payload,
@@ -2321,7 +2382,10 @@ async def chat_completions(request: Request) -> Any:
     if isinstance(response_data, dict):
         debug_cache_usage("non-stream", response_data)
 
-            # 附加工具调用：只处理本次新增的 calendar/health/weather，原有工具保持上游行为
+            # 附加工具调用：统一处理所有 gateway 本地工具，并补齐对应 tool_result
+    telegram_chat_id_for_tasks = (settings.telegram_target_chat_id or "").strip() or None
+    if not telegram_chat_id_for_tasks and isinstance(logical_session_id, str) and logical_session_id.startswith("telegram:"):
+        telegram_chat_id_for_tasks = logical_session_id.split(":", 1)[1].strip() or None
     try:
         while True:
             if not isinstance(response_data, dict):
@@ -2342,12 +2406,16 @@ async def chat_completions(request: Request) -> Any:
                     continue
                 function_obj = tc.get("function") if isinstance(tc.get("function"), dict) else {}
                 tool_name = function_obj.get("name")
-                if not isinstance(tool_name, str) or tool_name not in EXTRA_TOOL_NAMES:
+                if not isinstance(tool_name, str) or not str(tc.get("id") or ""):
                     continue
-                built = await build_extra_tool_message(tc)
-                if built is not None:
-                    matched = True
-                    tool_messages.append(built)
+                built = await build_local_tool_message(
+                    tc,
+                    settings=settings,
+                    history_session_id=history_session_id,
+                    telegram_chat_id=telegram_chat_id_for_tasks,
+                )
+                matched = True
+                tool_messages.append(built)
 
             if not matched:
                 break
