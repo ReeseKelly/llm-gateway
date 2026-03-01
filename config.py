@@ -64,6 +64,16 @@ class Settings(BaseSettings):
     weather_default_location: str = ""
     weather_units: str = "metric"
 
+    notes_log_path: str = "/data/notes_log.jsonl"
+    notes_default_ttl_days: int = 7
+    midterm_memory_path: str = "/data/midterm_memory.jsonl"
+    midterm_default_ttl_days: int = 14
+
+    ltm_index_path: str = "/data/ltm_index.json"
+
+    tasks_log_path: str = "/data/tasks.jsonl"
+    task_check_interval_minutes: int = 2
+
 @lru_cache
 def get_settings() -> Settings:
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -109,6 +119,13 @@ def get_settings() -> Settings:
         weather_api_key=os.getenv("WEATHER_API_KEY") or None,
         weather_default_location=os.getenv("WEATHER_DEFAULT_LOCATION", ""),
         weather_units=os.getenv("WEATHER_UNITS", "metric"),
+        notes_log_path=os.getenv("NOTES_LOG_PATH", "/data/notes_log.jsonl"),
+        notes_default_ttl_days=_safe_int(os.getenv("NOTES_DEFAULT_TTL_DAYS"), 7),
+        midterm_memory_path=os.getenv("MIDTERM_MEMORY_PATH", "/data/midterm_memory.jsonl"),
+        midterm_default_ttl_days=_safe_int(os.getenv("MIDTERM_DEFAULT_TTL_DAYS"), 14),
+        ltm_index_path=os.getenv("LTM_INDEX_PATH", "/data/ltm_index.json"),
+        tasks_log_path=os.getenv("TASKS_LOG_PATH", "/data/tasks.jsonl"),
+        task_check_interval_minutes=_safe_int(os.getenv("TASK_CHECK_INTERVAL_MINUTES"), 2),
     )
 
 

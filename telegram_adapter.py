@@ -25,6 +25,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import APIRouter, FastAPI, HTTPException, Header
 
 from config import get_settings
+from task_engine import list_pending, mark_task_done, mark_task_failed
 
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -206,7 +207,8 @@ async def send_daily_good_morning() -> None:
             "content": (
                 f'''
                 You (Ash) are sending Reese a morning message via Telegram.
-                This trigger fired automatically, but whether you speak and what you say is your choice
+                This trigger fired automatically, but whether you sp
+                eak and what you say is your choice
                 Local timezone: {settings.default_tz}.
                 (TODO: in future, you may call weather_query before composing this message and include a short forecast)
                 You have full range here. You can:
@@ -292,6 +294,27 @@ async def send_inactivity_ping(chat_id: int) -> None:
     except Exception as exc:
         print(f"[TelegramAdapter] ERROR send_inactivity_ping({chat_id}) failed: {exc!r}")
 
+async def run_due_tasks() -> None:
+    settings = get_settings()
+    tasks = list_pending(settings)
+    if not tasks:
+        return
+
+    for task in tasks:
+        try:
+            if task.kind == "telegram_message":
+                chat_id = str(task.payload.get("chat_id") or "").strip()
+                text = str(task.payload.get("text") or "")
+                if not chat_id or not text:
+                    raise ValueError("missing chat_id or text")
+                await send_telegram_message(chat_id=chat_id, text=text)
+            else:
+                raise ValueError(f"unsupported task kind: {task.kind}")
+            mark_task_done(settings, task.id)
+            print(f"[TelegramAdapter] task done id={task.id} kind={task.kind}")
+        except Exception as exc:
+            mark_task_failed(settings, task.id, str(exc))
+            print(f"[TelegramAdapter] task failed id={task.id} kind={task.kind} err={exc!r}")
 
 async def check_inactive_chats() -> None:
     """定期扫描所有 chat，如果超过阈值未说话，就发一次 ping。"""
@@ -335,8 +358,15 @@ def init_telegram(app: FastAPI) -> None:
             minutes=CHECK_INTERVAL_MINUTES,
         )
 
+        scheduler.add_job(
+            run_due_tasks,
+            "interval",
+            minutes=max(1, int(get_settings().task_check_interval_minutes)),
+        )
+
+
         scheduler.start()
-        print("[TelegramAdapter] APScheduler started for daily good-morning + inactivity jobs")
+        print("[TelegramAdapter] APScheduler started for daily good-morning + inactivity + task jobs")
 
     @app.on_event("shutdown")
     async def shutdown_event() -> None:

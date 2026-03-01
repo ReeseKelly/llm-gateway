@@ -32,6 +32,8 @@ from memories import (
 )
 
 from weather_tools import WEATHER_TOOLS, build_weather_tool_message
+from memory_v2 import MEMORY_TOOLS, build_memory_tool_message
+from task_engine import TASK_TOOLS, build_task_tool_message
 
 from telegram_adapter import router as telegram_router, init_telegram
 
@@ -1893,7 +1895,15 @@ def _extract_stream_text(obj: dict[str, Any]) -> str:
 
     return "".join(pieces)
 
-EXTRA_TOOL_NAMES = {"calendar_query", "calendar_create", "health_log", "health_query", "weather_query"}
+EXTRA_TOOL_NAMES = {
+    "calendar_query", "calendar_create",
+    "health_log", "health_query",
+    "weather_query",
+    "note_create", "note_list", "note_delete",
+    "midterm_upsert", "midterm_list", "midterm_mark_promoted",
+    "ltm_register_topic", "ltm_search",
+    "task_schedule_ping",
+}
 
 
 def merge_gateway_tools(incoming_tools: Any) -> list[dict[str, Any]]:
