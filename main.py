@@ -668,6 +668,38 @@ def resolve_summary_session_id(settings: Settings, logical_session_id: str | Non
     """
     return resolve_shared_session_id(settings, logical_session_id)
 
+def resolve_history_session_id(settings: Settings, logical_session_id: str | None) -> str | None:
+    """
+    chat_log/history 专用会话映射：
+    - 若配置 SHARED_SESSION_ID，Kelivo/Telegram 统一写入并读取同一时间线。
+    - 否则回退到传入 logical_session_id。
+    """
+    if not logical_session_id:
+        return None
+    if settings.shared_session_id:
+        return settings.shared_session_id
+    return logical_session_id
+
+def build_history_messages_from_records(
+    records: list[dict[str, Any]],
+    max_messages: int = 12,
+) -> list[dict[str, Any]]:
+    flattened: list[dict[str, Any]] = []
+    for rec in records:
+        req = rec.get("request_messages")
+        if isinstance(req, list):
+            for msg in req:
+                if isinstance(msg, dict) and msg.get("role") in {"user", "assistant"}:
+                    flattened.append({"role": msg.get("role"), "content": msg.get("content", "")})
+        reply = rec.get("reply_message")
+        if isinstance(reply, dict) and reply.get("role") in {"assistant", "user"}:
+            flattened.append({"role": reply.get("role"), "content": reply.get("content", "")})
+
+    if max_messages > 0:
+        flattened = flattened[-max_messages:]
+    return flattened
+
+
 def save_session_summary(settings: Settings, logical_session_id: str, summary_obj: dict[str, Any]) -> None:
     path = get_summary_store_path(settings)
     data = load_session_summaries(settings)
@@ -2009,6 +2041,7 @@ async def _proxy_streaming_chat_completion(
 
             # ==== 流结束后：用拼好的文本写日志 + 起 summarizer / pin ====
             if logical_session_id and isinstance(raw_messages, list):
+                history_session_id = resolve_history_session_id(settings, logical_session_id)
                 full_text = "".join(assistant_chunks).strip()
                 reply_message = {
                     "role": "assistant",
@@ -2019,7 +2052,7 @@ async def _proxy_streaming_chat_completion(
                 try:
                     append_chat_log(
                         settings=settings,
-                        logical_session_id=logical_session_id,
+                        logical_session_id=history_session_id or logical_session_id,
                         request_messages=log_request_messages,
                         reply_message=reply_message,
                     )
@@ -2084,8 +2117,30 @@ async def chat_completions(request: Request) -> Any:
 
     logical_session_id = resolve_shared_session_id(settings, logical_session_id)
 
+    history_session_id = resolve_history_session_id(settings, logical_session_id)
+    summary_session_id = resolve_summary_session_id(settings, logical_session_id)
+
     raw_messages = payload.get("messages")
     history_messages = raw_messages if isinstance(raw_messages, list) else []
+
+    # Telegram 一类仅传当前 user 的请求，补齐最近聊天原文历史
+    if history_session_id:
+        has_assistant_incoming = any(
+            isinstance(m, dict) and m.get("role") == "assistant"
+            for m in history_messages
+        )
+        if not has_assistant_incoming:
+            session_records = load_session_records(settings, history_session_id)
+            hydrated_history = build_history_messages_from_records(session_records, max_messages=12)
+            if hydrated_history:
+                history_messages = [*hydrated_history, *history_messages]
+
+    print(
+        "DEBUG [context-debug] "
+        f"logical_session_id={logical_session_id}, "
+        f"history_session_id={history_session_id}, "
+        f"summary_session_id={summary_session_id}"
+    )
 
     # 查看MCP
     tools = payload.get("tools")
@@ -2098,7 +2153,20 @@ async def chat_completions(request: Request) -> Any:
             for t in tools
         ])
 
-    payload["tools"] = merge_gateway_tools(tools)
+    client_tools = tools if isinstance(tools, list) else []
+    gateway_tools = CALENDAR_TOOLS + HEALTH_TOOLS + WEATHER_TOOLS
+    payload["tools"] = [*client_tools, *gateway_tools]
+
+    tool_names: list[str] = []
+    for t in payload.get("tools") or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            if name:
+                tool_names.append(str(name))
+    logger.info("DEBUG tool names (final tools list): %s", tool_names)
 
     # 先清理 Kelivo 的自动 Memory Tool 等注入段
     if isinstance(history_messages, list):
@@ -2213,6 +2281,7 @@ async def chat_completions(request: Request) -> Any:
 
         # ===== 流式分支：直接交给 _proxy_streaming_chat_completion =====
     if stream_flag:
+        # NOTE: streaming path currently only proxies upstream output and does not execute local tools.
         return await _proxy_streaming_chat_completion(
             settings=settings,
             payload=payload,
