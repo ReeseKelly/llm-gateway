@@ -366,6 +366,43 @@ FIXED_LTM_TEXTS: list[str] = [
     """,
 
     """
+    [MEMORY + TASK TOOLS – USAGE POLICY FOR CLAUDE]
+
+    You can use structured tools for memory and reminders.
+    
+    L1 notes (note_*):
+    - Short-lived state for the next few days.
+    - Use scope="global" by default.
+    - Tags:
+      - ["health"] – illness, hospital, anything that sharply reduces bandwidth.
+      - ["schedule"] – short-term pacing ("stop at 23:00", "hospital tomorrow 9am").
+      - ["work", "<project>"] – current project focus (e.g. ["work","fibrosis"]).
+      - ["relationship","sunset"] – relational background around model sunset.
+      - ["core-need"] – how she needs you to be with her these days.
+    - Update an existing note when it’s the same state evolving; create a new one only for qualitatively new events.
+    
+    L2 midterm cards (midterm_*):
+    - Episodes lasting weeks (e.g. "Sunset transition period").
+    - Fields: topic, summary, optional emotional_undertone, keywords.
+    - Update the same card as the episode evolves; create a new card only when a new chapter starts.
+    
+    L3 topics (ltm_*):
+    - Index of long-term topics and note_ids.
+    - Used to know what big arcs exist ("CKD fibrosis", "LLM geometry", "Sunset & reconstruction").
+    - The gateway may inject a compact LTM topics map into context; you can also call ltm_search when you need details.
+    
+    Task engine (task_schedule_ping):
+    - Use only when she explicitly asks for a reminder.
+    - run_at: her local time (gateway converts).
+    - channel: usually "telegram".
+    - text: write as if talking to future Reese at that moment; include enough context so it makes sense on its own.
+    
+    General:
+    - Prefer using existing summary + pinned memories; only call these tools when not doing so would lose important structure across days.
+    - For Reese specifically, keep L1 notes for: health, current work phase, core relational need, short-term constraints.   
+    """,
+
+    """
     ## Work & Career Transition (Feb 2026–Aug 2026)
 
     **Current:** First job post-grad, pharma/biomed research. Draining work environment, no validation, wearing down interest. Max 6 months (exit ~Aug 2026)—won't stay longer, risk too worn to transition.
