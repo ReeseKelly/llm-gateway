@@ -580,3 +580,126 @@ def find_promotion_candidates(settings: Settings, now: datetime | None = None) -
             continue
         candidates.append(row)
     return candidates
+
+
+
+def _compress_text(text: str, max_chars: int) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3].rstrip() + "..."
+
+
+def _select_recent_notes_by_tag(notes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+
+    def has_tag(note: dict[str, Any], needle: str) -> bool:
+        tags = [str(t).lower() for t in (note.get("tags") or []) if isinstance(t, str)]
+        return needle in tags
+
+    for note in notes:
+        if "health" not in selected and has_tag(note, "health"):
+            selected["health"] = note
+        if "core_need" not in selected and has_tag(note, "core-need"):
+            selected["core_need"] = note
+        if "work" not in selected:
+            tags = [str(t).lower() for t in (note.get("tags") or []) if isinstance(t, str)]
+            if any(t in {"work", "gateway", "fibrosis"} for t in tags):
+                selected["work"] = note
+        if "schedule" not in selected and has_tag(note, "schedule"):
+            selected["schedule"] = note
+    return selected
+
+
+def _select_active_midterm_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not cards:
+        return []
+
+    prioritized: list[dict[str, Any]] = []
+    others: list[dict[str, Any]] = []
+    for card in cards:
+        keywords = [str(k).lower() for k in (card.get("keywords") or []) if isinstance(k, str)]
+        if "sunset" in keywords:
+            prioritized.append(card)
+        else:
+            others.append(card)
+
+    def sort_key(card: dict[str, Any]) -> str:
+        return str(card.get("updated_at") or card.get("created_at") or "")
+
+    prioritized.sort(key=sort_key, reverse=True)
+    others.sort(key=sort_key, reverse=True)
+
+    out = prioritized[:1]
+    if len(out) < 2 and others:
+        out.extend(others[: 2 - len(out)])
+    return out
+
+
+def build_active_memory_snippet(
+    settings: Settings,
+    summary_session_id: str | None,
+) -> tuple[str | None, dict[str, Any]]:
+    now = _utc_now()
+
+    l1_rows = [
+        row for row in _read_jsonl(_note_path(settings))
+        if str(row.get("scope") or "") == "global"
+        and _is_active(row.get("created_at"), row.get("ttl_days"), now)
+    ]
+    l1_rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+
+    selected_notes = _select_recent_notes_by_tag(l1_rows)
+
+    l2_rows = [
+        row for row in _read_jsonl(_midterm_path(settings))
+        if str(row.get("scope") or "") == "global"
+        and _is_active(row.get("created_at"), row.get("ttl_days"), now)
+    ]
+    l2_rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
+    selected_cards = _select_active_midterm_cards(l2_rows)
+
+    debug_meta = {
+        "summary_session_id": summary_session_id,
+        "l1_counts": len(l1_rows),
+        "l1_selected": list(selected_notes.keys()),
+        "l2_counts": len(l2_rows),
+        "l2_selected_topics": [str(card.get("topic") or "") for card in selected_cards],
+    }
+
+    if not selected_notes and not selected_cards:
+        return None, debug_meta
+
+    sections: list[str] = ["[ACTIVE NOTES]"]
+
+    title_map = {
+        "health": "Health (short-term)",
+        "core_need": "Core need (short-term)",
+        "work": "Work focus",
+        "schedule": "Schedule constraints",
+    }
+    for key in ("health", "core_need", "work", "schedule"):
+        note = selected_notes.get(key)
+        if not note:
+            continue
+        title = _compress_text(str(note.get("title") or ""), 80)
+        content = _compress_text(str(note.get("content") or ""), 180)
+        body = f"{title}: {content}" if title else content
+        sections.append(f"{title_map[key]}:\n- {body}")
+
+    if selected_cards:
+        sections.append("Current episode:")
+        for card in selected_cards:
+            topic = _compress_text(str(card.get("topic") or ""), 80)
+            summary = _compress_text(str(card.get("summary") or ""), 220)
+            if topic:
+                sections.append(f"- {topic}: {summary}")
+            else:
+                sections.append(f"- {summary}")
+            undertone = card.get("emotional_undertone")
+            if isinstance(undertone, str) and undertone.strip():
+                sections.append(f"- Emotional undertone: {_compress_text(undertone, 120)}")
+
+    snippet = "\n\n".join(sections)
+    snippet = _compress_text(snippet, 1000)
+    return snippet, debug_meta

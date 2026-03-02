@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     tasks_log_path: str = "/data/tasks.jsonl"
     task_check_interval_minutes: int = 2
 
+    telemetry_webhook_token: str | None = None
+    telemetry_log_path: str = "/data/telemetry_log.jsonl"
+
 @lru_cache
 def get_settings() -> Settings:
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -126,6 +129,8 @@ def get_settings() -> Settings:
         ltm_index_path=os.getenv("LTM_INDEX_PATH", "/data/ltm_index.json"),
         tasks_log_path=os.getenv("TASKS_LOG_PATH", "/data/tasks.jsonl"),
         task_check_interval_minutes=_safe_int(os.getenv("TASK_CHECK_INTERVAL_MINUTES"), 2),
+        telemetry_webhook_token=os.getenv("TELEMETRY_WEBHOOK_TOKEN") or None,
+        telemetry_log_path=os.getenv("TELEMETRY_LOG_PATH", "/data/telemetry_log.jsonl"),
     )
 
 

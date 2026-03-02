@@ -28,7 +28,7 @@ from config import get_settings
 from task_engine import list_pending, mark_task_done, mark_task_failed
 
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 router = APIRouter()
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")

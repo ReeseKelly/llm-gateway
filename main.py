@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 import json
 from pathlib import Path
 import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import logging
 logger = logging.getLogger(__name__)
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from httpx_socks import AsyncProxyTransport
 
 from fastapi.responses import StreamingResponse
@@ -19,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from config import Settings, get_settings
 
 from calendar_tools import CALENDAR_TOOLS, execute_calendar_tool
-from health_client import SUPPORTED_HEALTH_METRICS, get_health_provider, parse_health_record
+from health_client import BaseHealthProvider, HealthRecord, SUPPORTED_HEALTH_METRICS, get_health_provider, parse_health_record
 from health_tools import HEALTH_TOOLS, execute_health_tool
 
 from memories import (
@@ -32,10 +33,11 @@ from memories import (
 )
 
 from weather_tools import WEATHER_TOOLS, execute_weather_tool
-from memory_v2 import MEMORY_TOOLS, execute_memory_tool
+from memory_v2 import MEMORY_TOOLS, build_active_memory_snippet, execute_memory_tool
 from task_engine import TASK_TOOLS, execute_task_tool
 
 from telegram_adapter import router as telegram_router, init_telegram
+from telemetry_utils import get_health_daily_summary, get_latest_telemetry_snapshot
 
 MAX_PINNED_FOR_CONTEXT = 3          # 每次最多给主模型看的 pinned 数量
 MAX_LTM_FOR_CONTEXT = 2             # 每次最多给主模型看的 LTM 数量
@@ -56,6 +58,10 @@ MAX_CHARS_PER_MESSAGE_FOR_SUMMARY = 1500   # 单条 message 最多保留多少�
 MAX_SUMMARY_INPUT_TOKENS = 60000          # 估算的 token 上限，超过就跳过本次 summarization
 
 ACTIVE_MEMORIES: dict[str, dict[str, int]] = {}
+HEALTH_FIELD_MAP: dict[str, str] = {
+    "steps_today": "steps",
+    "sleep_hours": "sleep_hours",
+}
 
 SUMMARY_SYSTEM_PROMPT = """You are a session summarizer for a long-running, high-context conversation between a single user (Reese) and an assistant (Claude/Ash).
 
@@ -2312,6 +2318,20 @@ async def chat_completions(request: Request) -> Any:
             f"{[(m.get('id'), m.get('kind'), m.get('topic')) for m in active_memories]}"
         )
 
+    active_snippet, snippet_meta = build_active_memory_snippet(
+        settings=settings,
+        summary_session_id=summary_session_id,
+    )
+    if active_snippet:
+        system_messages.append({"role": "system", "content": active_snippet})
+        logger.debug(
+            "active_memory: snippet_len=%d, l1_total=%d, l1_selected=%s, l2_total=%d, l2_selected=%s",
+            len(active_snippet),
+            int(snippet_meta.get("l1_counts", 0)),
+            snippet_meta.get("l1_selected", []),
+            int(snippet_meta.get("l2_counts", 0)),
+            snippet_meta.get("l2_selected_topics", []),
+        )
 
     print("DEBUG system_messages before context budget:")
     for msg in system_messages:
@@ -2505,6 +2525,90 @@ async def health_webhook_apple(payload: dict[str, Any] = Body(...)) -> Any:
     )
 
     return {"ok": True, "incoming": len(records), "written": written, "metrics": metric_names}
+
+@app.post("/telemetry/webhook/ios")
+async def telemetry_webhook_ios(
+    payload: dict[str, Any] = Body(...),
+    request: Request | None = None,
+    settings: Settings = Depends(get_settings),
+    health_provider: BaseHealthProvider = Depends(get_health_provider),
+) -> Any:
+
+    expected = (settings.telemetry_webhook_token or "").strip()
+    incoming = str(payload.get("token") or "").strip()
+    if expected and incoming != expected:
+        raise HTTPException(status_code=403, detail="invalid token")
+
+    tz = ZoneInfo(settings.default_tz)
+    now = datetime.now(tz).replace(microsecond=0)
+
+    ip = None
+    if request is not None and request.client is not None:
+        ip = request.client.host
+
+    record = {
+        "received_at": now.isoformat(),
+        "ip": ip,
+        "payload": payload,
+    }
+
+    telemetry_path = Path(settings.telemetry_log_path)
+    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+    with telemetry_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False))
+        f.write("\n")
+
+    today = now.date()
+    day_start = datetime.combine(today, time.min, tz)
+    day_end = datetime.combine(today, time.max, tz)
+
+    records: list[HealthRecord] = []
+    for source_field, metric in HEALTH_FIELD_MAP.items():
+        raw_value = payload.get(source_field)
+        if raw_value is None:
+            continue
+        try:
+            val = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if val < 0:
+            continue
+        records.append(
+            HealthRecord(
+                metric=metric,
+                value=val,
+                start=day_start,
+                end=day_end,
+            )
+        )
+
+    written = 0
+    if records:
+        written = health_provider.append_records(records)
+
+    return {"ok": True, "telemetry_logged": True, "written": written}
+
+
+@app.get("/debug/telemetry/latest")
+async def debug_latest_telemetry(
+    max_age_minutes: int = 60,
+    settings: Settings = Depends(get_settings),
+) -> Any:
+    snapshot = await get_latest_telemetry_snapshot(max_age_minutes=max_age_minutes, settings=settings)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="no recent telemetry")
+    return snapshot
+
+
+@app.get("/debug/health/daily_summary")
+async def debug_health_daily_summary(
+    metrics: str,
+    days: int = 7,
+    settings: Settings = Depends(get_settings),
+) -> Any:
+    metrics_list = [m.strip() for m in metrics.split(",") if m.strip()]
+    return await get_health_daily_summary(metrics=metrics_list, days=days, settings=settings)
+
 
 
 @app.post("/internal/list_pinned_memories")
