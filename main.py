@@ -2529,7 +2529,7 @@ async def health_webhook_apple(payload: dict[str, Any] = Body(...)) -> Any:
 @app.post("/telemetry/webhook/ios")
 async def telemetry_webhook_ios(
     payload: dict[str, Any] = Body(...),
-    request: Request | None = None,
+    request: Request,
     settings: Settings = Depends(get_settings),
     health_provider: BaseHealthProvider = Depends(get_health_provider),
 ) -> Any:
