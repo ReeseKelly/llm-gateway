@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 
 import logging
 logger = logging.getLogger(__name__)
+if logger.level == logging.NOTSET:
+    logger.setLevel(logging.INFO)
 
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
@@ -2539,6 +2541,15 @@ async def chat_completions(request: Request) -> Any:
 @app.post("/health/webhook/apple")
 async def health_webhook_apple(payload: dict[str, Any] = Body(...)) -> Any:
     settings = get_settings()
+
+    safe_payload = dict(payload) if isinstance(payload, dict) else {"_raw": str(payload)}
+
+    if isinstance(safe_payload, dict) and "token" in safe_payload:
+        safe_payload["token"] = "***redacted***"
+    logger.info(
+        "Incoming health payload\n%s",
+        json.dumps(safe_payload, ensure_ascii=False, indent=2),
+    )
     expected_token = (settings.health_webhook_token or "").strip()
     incoming_token = str(payload.get("token") or "").strip()
 
@@ -2570,6 +2581,14 @@ async def telemetry_webhook_ios(
     settings: Settings = Depends(get_settings),
     health_provider: BaseHealthProvider = Depends(get_health_provider),
 ) -> Any:
+    
+    safe_payload = dict(payload) if isinstance(payload, dict) else {"_raw": str(payload)}
+    if isinstance(safe_payload, dict) and "token" in safe_payload:
+        safe_payload["token"] = "***redacted***"
+    logger.info(
+        "Incoming telemetry payload\n%s",
+        json.dumps(safe_payload, ensure_ascii=False, indent=2),
+    )
 
     expected = (settings.telemetry_webhook_token or "").strip()
     incoming = str(payload.get("token") or "").strip()
