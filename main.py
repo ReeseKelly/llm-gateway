@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
@@ -34,9 +34,10 @@ from memories import (
     load_pinned_memories,
 )
 
-from weather_tools import WEATHER_TOOLS, execute_weather_tool
+
 from memory_v2 import MEMORY_TOOLS, build_active_memory_snippet, execute_memory_tool
 from task_engine import TASK_TOOLS, execute_task_tool
+from telemetry_tools import TELEMETRY_TOOLS, execute_telemetry_tool
 
 from telegram_adapter import router as telegram_router, init_telegram
 from telemetry_utils import get_health_daily_summary, get_latest_telemetry_snapshot
@@ -60,10 +61,6 @@ MAX_CHARS_PER_MESSAGE_FOR_SUMMARY = 1500   # 单条 message 最多保留多少�
 MAX_SUMMARY_INPUT_TOKENS = 60000          # 估算的 token 上限，超过就跳过本次 summarization
 
 ACTIVE_MEMORIES: dict[str, dict[str, int]] = {}
-HEALTH_FIELD_MAP: dict[str, str] = {
-    "steps_today": "steps",
-    "sleep_hours": "sleep_hours",
-}
 
 SUMMARY_SYSTEM_PROMPT = """You are a session summarizer for a long-running, high-context conversation between a single user (Reese) and an assistant (Claude/Ash).
 
@@ -1955,7 +1952,7 @@ def merge_gateway_tools(incoming_tools: Any) -> list[dict[str, Any]]:
         if isinstance(name, str):
             existing_names.add(name)
 
-    for tool in (CALENDAR_TOOLS + HEALTH_TOOLS + WEATHER_TOOLS + MEMORY_TOOLS + TASK_TOOLS):
+    for tool in (CALENDAR_TOOLS + HEALTH_TOOLS + TELEMETRY_TOOLS + MEMORY_TOOLS + TASK_TOOLS):
         func = tool.get("function") if isinstance(tool.get("function"), dict) else {}
         name = func.get("name")
         if isinstance(name, str) and name in existing_names:
@@ -1997,8 +1994,8 @@ async def dispatch_local_tool(
     if tool_name.startswith("health_"):
         return execute_health_tool(tool_name, arguments)
 
-    if tool_name.startswith("weather_"):
-        return await execute_weather_tool(tool_name, arguments)
+    if tool_name.startswith("telemetry_"):
+        return execute_telemetry_tool(tool_name, arguments)
 
     if tool_name.startswith("note_") or tool_name.startswith("midterm_") or tool_name.startswith("ltm_"):
         return execute_memory_tool(
@@ -2585,6 +2582,11 @@ async def telemetry_webhook_ios(
     safe_payload = dict(payload) if isinstance(payload, dict) else {"_raw": str(payload)}
     if isinstance(safe_payload, dict) and "token" in safe_payload:
         safe_payload["token"] = "***redacted***"
+    
+    print("=== TELEMETRY PAYLOAD START ===")
+    print(json.dumps(safe_payload, ensure_ascii=False))
+    print("=== TELEMETRY PAYLOAD END ===")
+
     logger.info(
         "Incoming telemetry payload\n%s",
         json.dumps(safe_payload, ensure_ascii=False, indent=2),
@@ -2597,15 +2599,64 @@ async def telemetry_webhook_ios(
 
     tz = ZoneInfo(settings.default_tz)
     now = datetime.now(tz).replace(microsecond=0)
+    incoming_ts_raw = payload.get("timestamp")
+    event_ts = now
+    if isinstance(incoming_ts_raw, str) and incoming_ts_raw.strip():
+        try:
+            ts_text = incoming_ts_raw.strip()
+            if ts_text.endswith("Z"):
+                ts_text = ts_text[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(ts_text)
+            event_ts = parsed.astimezone(tz) if parsed.tzinfo else parsed.replace(tzinfo=tz)
+        except Exception:
+            event_ts = now
 
     ip = None
     if request is not None and request.client is not None:
         ip = request.client.host
 
+    raw_payload = dict(payload)
+    raw_payload.pop("token", None)
+
+    session_id_raw = payload.get("session_id")
+    session_id = str(session_id_raw).strip() if session_id_raw is not None else ""
+    if not session_id:
+        session_id = None
+
+    battery_pct = payload.get("battery_pct")
+    norm_battery = None
+    if isinstance(battery_pct, (int, float)):
+        b = float(battery_pct)
+        if b > 1:
+            b = b / 100.0
+        norm_battery = max(0.0, min(1.0, b))
+
+    location = None
+    if isinstance(payload.get("lat"), (int, float)) and isinstance(payload.get("lon"), (int, float)):
+        location = {"lat": float(payload.get("lat")), "lon": float(payload.get("lon"))}
+
+    weather = None
+    if payload.get("weather_cond") is not None or payload.get("weather_temp_c") is not None:
+        weather = {
+            "cond": payload.get("weather_cond"),
+            "temp_c": payload.get("weather_temp_c"),
+        }
+
     record = {
-        "received_at": now.isoformat(),
+        "session_id": session_id,
+        "timestamp": now.isoformat(),
+        "event_timestamp": event_ts.isoformat(),
         "ip": ip,
         "payload": payload,
+        "steps_today": payload.get("steps_today"),
+        "sleep_duration_sec": payload.get("sleep_duration_sec"),
+        "heart_rate_rest": payload.get("heart_rate_rest"),
+        "battery_pct": norm_battery,
+        "location": location,
+        "weather": weather,
+        "raw_location_label": payload.get("raw_location_label"),
+        "raw_weather_desc": payload.get("raw_weather_desc"),
+        "raw": raw_payload,
     }
 
     telemetry_path = Path(settings.telemetry_log_path)
@@ -2614,35 +2665,25 @@ async def telemetry_webhook_ios(
         f.write(json.dumps(record, ensure_ascii=False))
         f.write("\n")
 
-    today = now.date()
-    day_start = datetime.combine(today, time.min, tz)
-    day_end = datetime.combine(today, time.max, tz)
-
     records: list[HealthRecord] = []
-    for source_field, metric in HEALTH_FIELD_MAP.items():
-        raw_value = payload.get(source_field)
-        if raw_value is None:
-            continue
-        try:
-            val = float(raw_value)
-        except (TypeError, ValueError):
-            continue
-        if val < 0:
-            continue
-        records.append(
-            HealthRecord(
-                metric=metric,
-                value=val,
-                start=day_start,
-                end=day_end,
-            )
-        )
+    steps = payload.get("steps_today")
+    if isinstance(steps, (int, float)) and float(steps) >= 0:
+        records.append(HealthRecord(metric="steps", value=float(steps), start=event_ts, end=event_ts))
+
+    sleep_sec = payload.get("sleep_duration_sec")
+    if isinstance(sleep_sec, (int, float)) and float(sleep_sec) >= 0:
+        sleep_hours = float(sleep_sec) / 3600.0
+        records.append(HealthRecord(metric="sleep_hours", value=round(sleep_hours, 4), start=event_ts, end=event_ts))
+
+    heart_rate = payload.get("heart_rate_rest")
+    if isinstance(heart_rate, (int, float)) and float(heart_rate) >= 0:
+        records.append(HealthRecord(metric="heart_rate", value=float(heart_rate), start=event_ts, end=event_ts))
 
     written = 0
     if records:
         written = health_provider.append_records(records)
 
-    return {"ok": True, "telemetry_logged": True, "written": written}
+    return {"ok": True, "telemetry_logged": True, "written": written, "health_metrics_written": len(records)}
 
 
 @app.get("/debug/telemetry/latest")

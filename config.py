@@ -59,11 +59,6 @@ class Settings(BaseSettings):
     timezone: str = "Asia/Shanghai"
     default_tz: str = "Asia/Shanghai"
 
-    weather_api_url: str = ""
-    weather_api_key: str | None = None
-    weather_default_location: str = ""
-    weather_units: str = "metric"
-
     notes_log_path: str = "/data/notes_log.jsonl"
     notes_default_ttl_days: int = 7
     midterm_memory_path: str = "/data/midterm_memory.jsonl"
@@ -118,10 +113,7 @@ def get_settings() -> Settings:
         health_webhook_token=os.getenv("HEALTH_WEBHOOK_TOKEN", ""),
         timezone=os.getenv("TIMEZONE", "Asia/Shanghai"),
         default_tz=os.getenv("DEFAULT_TZ", os.getenv("TIMEZONE", "Asia/Shanghai")),
-        weather_api_url=os.getenv("WEATHER_API_URL", ""),
-        weather_api_key=os.getenv("WEATHER_API_KEY") or None,
-        weather_default_location=os.getenv("WEATHER_DEFAULT_LOCATION", ""),
-        weather_units=os.getenv("WEATHER_UNITS", "metric"),
+
         notes_log_path=os.getenv("NOTES_LOG_PATH", "/data/notes_log.jsonl"),
         notes_default_ttl_days=_safe_int(os.getenv("NOTES_DEFAULT_TTL_DAYS"), 7),
         midterm_memory_path=os.getenv("MIDTERM_MEMORY_PATH", "/data/midterm_memory.jsonl"),

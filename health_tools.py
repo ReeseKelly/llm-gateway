@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
-from typing import Any
+from statistics import mean
+from zoneinfo import ZoneInfo
+from statistics import mean
+from typing import TYPE_CHECKING, Any
+from config import get_settings
+if TYPE_CHECKING:
+    from config import Settings
 
 from health_client import (
     SUPPORTED_HEALTH_METRICS,
@@ -49,59 +55,213 @@ HEALTH_TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start": {"type": "string", "description": "ISO 8601 datetime"},
-                    "end": {"type": "string", "description": "ISO 8601 datetime"},
                     "metrics": {
                         "type": "array",
-                        "items": {"type": "string", "enum": sorted(SUPPORTED_HEALTH_METRICS)},
+                        "items": {
+                            "type": "string",
+                            "enum": ["steps", "sleep_hours", "heart_rate", "period"],
+                        },
+                        "description": "Which health metrics to query.",
                     },
-                    "aggregation": {"type": "string", "enum": ["raw", "daily"]},
-                    "limit": {"type": "integer"},
+                    "days": {
+                        "type": "integer",
+                        "description": "How many recent days to query (default 7, max 60).",
+                        "default": 7,
+                        "minimum": 1,
+                        "maximum": 60,
+                    },
                 },
+                "required":["metrics"],
             },
         },
     },
 ]
 
 
-def _parse_iso_datetime(value: str | None) -> datetime | None:
-    if not value:
+UNIT_BY_METRIC = {
+    "steps": "count",
+    "sleep_hours": "hours",
+    "heart_rate": "bpm",
+    "period": "status",
+}
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, bool):
         return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    dt = datetime.fromisoformat(text)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
-def _aggregate_daily(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    buckets: dict[str, list[float]] = defaultdict(list)
-    passthrough: list[dict[str, Any]] = []
+def _trend(values: list[float]) -> str:
+    if len(values) < 2:
+        return "flat"
+    first = values[0]
+    last = values[-1]
+    delta = last - first
+    threshold = max(0.05, abs(first) * 0.03)
+    if delta > threshold:
+        return "up"
+    if delta < -threshold:
+        return "down"
+    return "flat"
 
-    for row in records:
-        val = row.get("value")
-        day = str(row.get("start", ""))[:10]
-        if isinstance(val, (int, float)) and day:
-            buckets[day].append(float(val))
-        else:
-            passthrough.append(row)
 
-    out: list[dict[str, Any]] = []
-    for day, values in sorted(buckets.items()):
-        out.append(
-            {
-                "day": day,
-                "count": len(values),
-                "sum": round(sum(values), 3),
-                "avg": round(sum(values) / len(values), 3),
-                "min": round(min(values), 3),
-                "max": round(max(values), 3),
+async def run_health_query(
+    metrics: list[str],
+    days: int = 7,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    cfg = settings or get_settings()
+    tz = ZoneInfo(cfg.default_tz)
+
+    wanted = [m for m in metrics if m in SUPPORTED_HEALTH_METRICS]
+    if not wanted:
+        return {"metrics": {}}
+
+    day_window = max(1, min(int(days), 60))
+    now = datetime.now(tz)
+    start_dt = now - timedelta(days=day_window)
+
+    provider = get_health_provider()
+    rows = provider.list_metrics(
+        start=start_dt.astimezone(start_dt.tzinfo),
+        end=now.astimezone(start_dt.tzinfo),
+        metrics=wanted,
+        limit=5000,
+    )
+
+    daily_buckets: dict[str, dict[str, list[float]]] = {
+        metric: defaultdict(list) for metric in wanted
+    }
+
+    for row in rows:
+        metric = row.metric
+        if metric not in daily_buckets:
+            continue
+        day = row.start.astimezone(tz).date().isoformat()
+        v = _coerce_float(row.value)
+        if v is None:
+            continue
+        daily_buckets[metric][day].append(v)
+
+    out_metrics: dict[str, Any] = {}
+    for metric in wanted:
+        day_map = daily_buckets.get(metric, {})
+        daily_points: list[dict[str, Any]] = []
+        for day in sorted(day_map.keys()):
+            values = day_map[day]
+            agg_value = sum(values)
+            daily_points.append({"date": day, "value": round(agg_value, 3)})
+
+        values_only = [float(p["value"]) for p in daily_points]
+        if values_only:
+            summary = {
+                "avg": round(mean(values_only), 3),
+                "min": round(min(values_only), 3),
+                "max": round(max(values_only), 3),
+                "trend": _trend(values_only),
             }
-        )
-    out.extend(passthrough[:20])
-    return out
+        else: 
+           summary = {
+                "avg": None,
+                "min": None,
+                "max": None,
+                "trend": "flat",
+            }
+        out_metrics[metric] = {
+            "unit": UNIT_BY_METRIC.get(metric, "value"),
+            "daily": daily_points,
+            "summary": summary,
+        }
+
+    return {"metrics": out_metrics}
+
+def _trend(values: list[float]) -> str:
+    if len(values) < 2:
+        return "flat"
+    delta = values[-1] - values[0]
+    if abs(delta) < 1e-6:
+        return "flat"
+    return "up" if delta > 0 else "down"
+
+
+def _unit_for_metric(metric: str) -> str:
+    if metric == "steps":
+        return "count"
+    if metric == "sleep_hours":
+        return "hours"
+    if metric == "heart_rate":
+        return "bpm"
+    return "state"
+
+
+def _build_health_summary_by_days(metrics: list[str], days: int) -> dict[str, Any]:
+    cfg = get_settings()
+    tz = ZoneInfo(cfg.default_tz)
+    now = datetime.now(tz)
+    day_count = max(1, min(int(days or 7), 60))
+    start_dt = (now - timedelta(days=day_count - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    provider = get_health_provider()
+    rows = provider.list_metrics(
+        start=start_dt.astimezone(timezone.utc),
+        end=now.astimezone(timezone.utc),
+        metrics=metrics,
+        limit=5000,
+    )
+
+    grouped: dict[str, dict[str, list[float]]] = {m: defaultdict(list) for m in metrics}
+    for row in rows:
+        if row.metric not in grouped:
+            continue
+        if not isinstance(row.value, (int, float)):
+            continue
+        local_day = row.start.astimezone(tz).date().isoformat()
+        grouped[row.metric][local_day].append(float(row.value))
+
+    metrics_payload: dict[str, Any] = {}
+    summary_chunks: list[str] = []
+    for metric in metrics:
+        day_map = grouped.get(metric, {})
+        daily: list[dict[str, Any]] = []
+        for day in sorted(day_map.keys()):
+            values = day_map[day]
+            daily.append({"date": day, "value": round(sum(values), 3)})
+
+        agg_values = [float(d["value"]) for d in daily]
+        if agg_values:
+            summary = {
+                "avg": round(sum(agg_values) / len(agg_values), 3),
+                "min": round(min(agg_values), 3),
+                "max": round(max(agg_values), 3),
+                "trend": _trend(agg_values),
+            }
+        else:
+            summary = {"avg": 0.0, "min": 0.0, "max": 0.0, "trend": "flat"}
+
+        metrics_payload[metric] = {
+            "unit": _unit_for_metric(metric),
+            "daily": daily,
+            "summary": summary,
+        }
+        if agg_values:
+            summary_chunks.append(f"{metric} 近{day_count}天均值 {summary['avg']}")
+        else:
+            summary_chunks.append(f"{metric} 近{day_count}天暂无记录")
+
+    return {
+        "ok": True,
+        "days": day_count,
+        "metrics": metrics_payload,
+        "summary_text": {"health": "；".join(summary_chunks)},
+    }
 
 
 def execute_health_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -125,46 +285,22 @@ def execute_health_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, 
             return {"ok": True, "written": written, "metrics": metric_names}
 
         if tool_name == "health_query":
-            start = _parse_iso_datetime(arguments.get("start"))
-            end = _parse_iso_datetime(arguments.get("end"))
-
-            metrics_arg = arguments.get("metrics")
-            metrics = None
-            if isinstance(metrics_arg, list) and metrics_arg:
-                metrics = [str(m) for m in metrics_arg if str(m) in SUPPORTED_HEALTH_METRICS]
-
-            limit = int(arguments.get("limit", 200))
-            limit = max(1, min(limit, 1000))
-
-            rows = provider.list_metrics(start=start, end=end, metrics=metrics, limit=limit)
-
-            grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for row in rows:
-                grouped[row.metric].append(row.to_dict())
-
-            aggregation = str(arguments.get("aggregation") or "raw")
-            if aggregation == "daily":
-                payload_metrics = {k: _aggregate_daily(v) for k, v in grouped.items()}
-            else:
-                payload_metrics = dict(grouped)
-
-            total_points = sum(len(v) for v in payload_metrics.values())
-            logger.info("TOOL health_query metrics=%s from=%s to=%s ok=%s total_points=%s", list(payload_metrics.keys()), start.isoformat() if start else None, end.isoformat() if end else None, True, total_points)
-            print(f"TOOL health_query metrics={list(payload_metrics.keys())} from={start.isoformat() if start else None} to={end.isoformat() if end else None} ok=True total_points={total_points}")
-
-            return {
-                "ok": True,
-                "metrics": payload_metrics,
-                "count": total_points,
-                "window": {
-                    "start": start.isoformat() if start else None,
-                    "end": end.isoformat() if end else None,
-                },
-            }
+            return {"ok": False, "error": "health_query is async-only; use execute_health_tool_async"}
 
         return {"ok": False, "error": f"unsupported tool: {tool_name}"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+async def execute_health_tool_async(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if tool_name == "health_query":
+        metrics_arg = arguments.get("metrics")
+        if not isinstance(metrics_arg, list) or not metrics_arg:
+            return {"ok": False, "error": "metrics must be a non-empty list"}
+        metrics = [str(m) for m in metrics_arg]
+        days = int(arguments.get("days", 7) or 7)
+        payload = await run_health_query(metrics=metrics, days=days)
+        return {"ok": True, **payload}
+    return execute_health_tool(tool_name, arguments)
 
 
 def build_health_tool_message(tool_call_id: str, tool_name: str, arguments_json: str) -> dict[str, Any]:
