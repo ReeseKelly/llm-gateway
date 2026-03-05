@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from telegram_adapter import send_debug_message
 from uuid import uuid4
 
 from config import Settings
@@ -89,12 +90,235 @@ class MidtermCard:
     topic: str
     keywords: list[str]
     summary: str
+    emotional_undertone: str | None
     created_at: str
     updated_at: str
     ttl_days: int
     scope: str
     promoted_to_ltm: bool
     last_used_at: str | None = None
+
+class NoteChangeEvent:
+    id: str
+    note_id: str
+    kind: str
+    actor: str
+    action: str
+    timestamp: str
+    title_before: str | None
+    title_after: str | None
+    content_before: str | None
+    content_after: str | None
+    tags_before: list[str] | None
+    tags_after: list[str] | None
+
+
+def _change_log_path(settings: Settings) -> Path:
+    return Path(settings.notes_change_log_path)
+
+
+def _append_change_event(settings: Settings, event: NoteChangeEvent) -> None:
+    path = _change_log_path(settings)
+    _ensure_parent(path)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
+
+
+def _list_change_events(settings: Settings, *, kind: str, note_id: str | None = None) -> list[dict[str, Any]]:
+    rows = _read_jsonl(_change_log_path(settings))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if str(row.get("kind") or "") != kind:
+            continue
+        if note_id is not None and str(row.get("note_id") or "") != note_id:
+            continue
+        out.append(row)
+    out.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+    return out
+
+
+def notify_memory_event(settings: Settings, kind: str, record: NoteRecord | MidtermCard | dict[str, Any], actor: str) -> None:
+    if actor != "model":
+        return
+    if not settings.memory_event_enabled or not settings.memory_event_telegram_chat_id:
+        return
+
+    payload = asdict(record) if not isinstance(record, dict) else record
+    if kind == "note_created":
+        text = (
+            "🌱 L1 note (model)\n"
+            f"title: {str(payload.get('title') or '').strip() or '(untitled)'}\n"
+            f"tags: {list(payload.get('tags') or [])}\n"
+            f"ttl: {int(payload.get('ttl_days') or 0)}d"
+        )
+    elif kind == "note_updated":
+        text = (
+            "✏️ L1 note updated (model)\n"
+            f"title: {str(payload.get('title') or '').strip() or '(untitled)'}\n"
+            f"tags: {list(payload.get('tags') or [])}"
+        )
+    elif kind == "midterm_upserted":
+        text = (
+            "🧩 L2 midterm (model)\n"
+            f"topic: {str(payload.get('topic') or '').strip() or '(untitled)'}\n"
+            f"keywords: {list(payload.get('keywords') or [])}"
+        )
+    else:
+        return
+
+    send_debug_message(text=text, chat_id=settings.memory_event_telegram_chat_id)
+
+
+def get_active_notes(settings: Settings, shared_session_id: str | None, scope: str = "default") -> list[dict[str, Any]]:
+    now = _utc_now()
+    rows = _read_jsonl(_note_path(settings))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        row_scope = str(row.get("scope") or "")
+        if not _is_active(row.get("created_at"), row.get("ttl_days"), now):
+            continue
+        if scope == "global" and row_scope != "global":
+            continue
+        if scope == "session" and row_scope != "session":
+            continue
+        if scope == "default":
+            if row_scope == "session" and row.get("session_id") != shared_session_id:
+                continue
+            if row_scope not in {"global", "session"}:
+                continue
+        elif scope == "all":
+            if row_scope == "session" and row.get("session_id") != shared_session_id:
+                continue
+        elif scope not in {"global", "session"}:
+            if row_scope == "session" and row.get("session_id") != shared_session_id:
+                continue
+            if row_scope not in {"global", "session"}:
+                continue
+        if row_scope == "session" and row.get("session_id") != shared_session_id:
+            continue
+        out.append(row)
+    out.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+    return out
+
+
+def get_note_by_id(settings: Settings, note_id: str) -> dict[str, Any] | None:
+    for row in _read_jsonl(_note_path(settings)):
+        if str(row.get("id") or "") == note_id:
+            return row
+    return None
+
+
+def update_note_by_id(
+    settings: Settings,
+    note_id: str,
+    *,
+    actor: str,
+    title: str | None = None,
+    content: str | None = None,
+    tags: list[str] | None = None,
+    ttl_days: int | None = None,
+) -> dict[str, Any] | None:
+    rows = _read_jsonl(_note_path(settings))
+    now_iso = _to_iso(_utc_now())
+    updated: dict[str, Any] | None = None
+    for row in rows:
+        if str(row.get("id") or "") != note_id:
+            continue
+        before = dict(row)
+        if title is not None:
+            row["title"] = title
+        if content is not None:
+            row["content"] = content
+        if tags is not None:
+            row["tags"] = [str(x) for x in tags]
+        if ttl_days is not None:
+            row["ttl_days"] = int(ttl_days)
+        row["updated_at"] = now_iso
+        updated = row
+        event = NoteChangeEvent(
+            id=uuid4().hex,
+            note_id=note_id,
+            kind="note",
+            actor=actor,
+            action="update",
+            timestamp=now_iso,
+            title_before=before.get("title"),
+            title_after=row.get("title"),
+            content_before=before.get("content"),
+            content_after=row.get("content"),
+            tags_before=list(before.get("tags") or []),
+            tags_after=list(row.get("tags") or []),
+        )
+        _append_change_event(settings, event)
+        break
+    if updated is None:
+        return None
+    _write_jsonl(_note_path(settings), rows)
+    return updated
+
+
+def get_active_midterms(settings: Settings, shared_session_id: str | None) -> list[dict[str, Any]]:
+    now = _utc_now()
+    rows = _read_jsonl(_midterm_path(settings))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        scope = str(row.get("scope") or "")
+        if scope not in {"global", "session"}:
+            continue
+        if scope == "session" and row.get("session_id") != shared_session_id:
+            continue
+        if not _is_active(row.get("created_at"), row.get("ttl_days"), now):
+            continue
+        out.append(row)
+    out.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+    return out
+
+
+def get_note_changes(settings: Settings, note_id: str) -> list[dict[str, Any]]:
+    return _list_change_events(settings, kind="note", note_id=note_id)
+
+
+def _build_short_lines(items: list[str], limit: int) -> list[str]:
+    out: list[str] = []
+    used = 0
+    for item in items:
+        if used + len(item) > limit:
+            break
+        out.append(item)
+        used += len(item)
+    return out
+
+
+def build_active_notes_snippet(settings: Settings, session_id: str | None, now: datetime) -> str | None:
+    notes = get_active_notes(settings, session_id, scope="default")
+    midterms = get_active_midterms(settings, session_id)
+
+    lines: list[str] = ["[ACTIVE NOTES - SHORT]"]
+    l1_lines: list[str] = []
+    for row in notes[:3]:
+        title = _compress_text(str(row.get("title") or "(untitled)"), 48)
+        content = _compress_text(str(row.get("content") or ""), 72)
+        l1_lines.append(f"- {title}: {content}")
+
+    l2_lines: list[str] = []
+    for row in midterms[:2]:
+        topic = _compress_text(str(row.get("topic") or "(untitled)"), 48)
+        summary = _compress_text(str(row.get("summary") or ""), 72)
+        undertone = _compress_text(str(row.get("emotional_undertone") or ""), 32)
+        suffix = f" ({undertone})" if undertone else ""
+        l2_lines.append(f"- {topic}: {summary}{suffix}")
+
+    if l1_lines:
+        lines.append("L1:")
+        lines.extend(_build_short_lines(l1_lines, 220))
+    if l2_lines:
+        lines.append("L2:")
+        lines.extend(_build_short_lines(l2_lines, 160))
+
+    if len(lines) <= 1:
+        return None
+    snippet = "\n".join(lines)
+    return _compress_text(snippet, 400)
 
 
 @dataclass
@@ -168,6 +392,7 @@ MIDTERM_TOOLS: list[dict[str, Any]] = [
                     "topic": {"type": "string"},
                     "keywords": {"type": "array", "items": {"type": "string"}},
                     "summary": {"type": "string"},
+                    "emotional_undertone": {"type": "string"},
                     "ttl_days": {"type": "integer", "description": "Optional TTL in days; if omitted, use default."},
                 },
                 "required": ["scope", "topic", "summary"],
@@ -295,6 +520,7 @@ def _compat_midterm_from_pinned(settings: Settings) -> list[dict[str, Any]]:
                 "updated_at": str(mem.get("updated_at") or mem.get("created_at") or _to_iso(_utc_now())),
                 "ttl_days": 3650,
                 "scope": str(mem.get("scope") or "session"),
+                "emotional_undertone": None,
                 "promoted_to_ltm": False,
                 "last_used_at": None,
                 "legacy_source": "pinned",
@@ -347,6 +573,24 @@ def execute_memory_tool(tool_name: str, arguments: dict[str, Any], *, settings: 
         rows = _read_jsonl(_note_path(settings))
         rows.append(asdict(record))
         _write_jsonl(_note_path(settings), rows)
+        _append_change_event(
+            settings,
+            NoteChangeEvent(
+                id=uuid4().hex,
+                note_id=record.id,
+                kind="note",
+                actor="model",
+                action="create",
+                timestamp=record.created_at,
+                title_before=None,
+                title_after=record.title,
+                content_before=None,
+                content_after=record.content,
+                tags_before=None,
+                tags_after=list(record.tags),
+            ),
+        )
+        notify_memory_event(settings, "note_created", record, "model")
         logger.info("memory_v2 note_create id=%s scope=%s", record.id, scope)
         return {"ok": True, "note": asdict(record)}
 
@@ -407,6 +651,7 @@ def execute_memory_tool(tool_name: str, arguments: dict[str, Any], *, settings: 
                 topic=topic,
                 keywords=[str(x) for x in (arguments.get("keywords") or []) if isinstance(x, str)],
                 summary=summary,
+                emotional_undertone=str(arguments.get("emotional_undertone") or "").strip() or None,
                 created_at=_to_iso(now),
                 updated_at=_to_iso(now),
                 ttl_days=int(arguments.get("ttl_days") or settings.midterm_default_ttl_days),
@@ -416,17 +661,58 @@ def execute_memory_tool(tool_name: str, arguments: dict[str, Any], *, settings: 
             )
             rows.append(asdict(card))
             result = asdict(card)
+            _append_change_event(
+                settings,
+                NoteChangeEvent(
+                    id=uuid4().hex,
+                    note_id=card.id,
+                    kind="midterm",
+                    actor="model",
+                    action="create",
+                    timestamp=card.created_at,
+                    title_before=None,
+                    title_after=card.topic,
+                    content_before=None,
+                    content_after=card.summary,
+                    tags_before=None,
+                    tags_after=list(card.keywords),
+                ),
+            )
         else:
+            before = dict(found)
             found["topic"] = topic
             found["summary"] = summary
+            found["emotional_undertone"] = str(arguments.get("emotional_undertone") or "").strip() or found.get("emotional_undertone")
             found["keywords"] = [str(x) for x in (arguments.get("keywords") or []) if isinstance(x, str)]
             found["scope"] = scope
             found["session_id"] = shared_session_id if scope == "session" else None
             found["ttl_days"] = int(arguments.get("ttl_days") or settings.midterm_default_ttl_days)
             found["updated_at"] = _to_iso(now)
             result = found
+            _append_change_event(
+                settings,
+                NoteChangeEvent(
+                    id=uuid4().hex,
+                    note_id=str(found.get("id") or ""),
+                    kind="midterm",
+                    actor="model",
+                    action="update",
+                    timestamp=str(found.get("updated_at") or _to_iso(now)),
+                    title_before=str(before.get("topic") or "") or None,
+                    title_after=str(found.get("topic") or "") or None,
+                    content_before=(
+                        f"summary: {str(before.get('summary') or '')}\nemotional_undertone: {str(before.get('emotional_undertone') or '')}"
+                    ),
+                    content_after=(
+                        f"summary: {str(found.get('summary') or '')}\nemotional_undertone: {str(found.get('emotional_undertone') or '')}"
+                    ),
+                    tags_before=list(before.get("keywords") or []),
+                    tags_after=list(found.get("keywords") or []),
+                ),
+            )
 
         _write_jsonl(_midterm_path(settings), rows)
+        notify_memory_event(settings, "midterm_upserted", result, "model")
         logger.info("memory_v2 midterm_upsert id=%s scope=%s", result.get("id"), result.get("scope"))
         return {"ok": True, "card": result}
 
