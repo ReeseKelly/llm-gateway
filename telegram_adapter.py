@@ -94,6 +94,22 @@ async def send_telegram_message(chat_id: int | str, text: str) -> None:
         print(f"[TelegramAdapter] ERROR send_telegram_message exception: {exc!r}")
 
 
+def send_debug_message(text: str, chat_id: int | str | None = None) -> None:
+    settings = get_settings()
+    target_chat_id = chat_id or settings.memory_event_telegram_chat_id
+    if not settings.telegram_bot_token or not target_chat_id:
+        return
+
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+    payload = {"chat_id": target_chat_id, "text": text}
+    try:
+        with httpx.Client(timeout=15.0, trust_env=False) as client:
+            resp = client.post(url, json=payload)
+            if resp.status_code >= 400:
+                print(f"[TelegramAdapter] WARN send_debug_message failed: {resp.status_code} {resp.text[:200]!r}")
+    except Exception as exc:
+        print(f"[TelegramAdapter] WARN send_debug_message exception: {exc!r}")
+
 # === Telegram webhook (passive chat) ===
 @router.post("/telegram/webhook")
 async def telegram_webhook(
