@@ -98,6 +98,7 @@ class MidtermCard:
     promoted_to_ltm: bool
     last_used_at: str | None = None
 
+@dataclass
 class NoteChangeEvent:
     id: str
     note_id: str
@@ -117,11 +118,12 @@ def _change_log_path(settings: Settings) -> Path:
     return Path(settings.notes_change_log_path)
 
 
-def _append_change_event(settings: Settings, event: NoteChangeEvent) -> None:
+def _append_change_event(settings: Settings, event: NoteChangeEvent | dict[str, Any]) -> None:
+    payload = asdict(event) if isinstance(event, NoteChangeEvent) else dict(event)
     path = _change_log_path(settings)
     _ensure_parent(path)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _list_change_events(settings: Settings, *, kind: str, note_id: str | None = None) -> list[dict[str, Any]]:
@@ -221,38 +223,60 @@ def update_note_by_id(
     rows = _read_jsonl(_note_path(settings))
     now_iso = _to_iso(_utc_now())
     updated: dict[str, Any] | None = None
+
     for row in rows:
         if str(row.get("id") or "") != note_id:
             continue
+
         before = dict(row)
+
         if title is not None:
-            row["title"] = title
+            row["title"] = str(title)
+        elif "title" not in row:
+            row["title"] = ""
+
         if content is not None:
-            row["content"] = content
+            row["content"] = str(content)
+        elif "content" not in row:
+            row["content"] = ""
+
         if tags is not None:
-            row["tags"] = [str(x) for x in tags]
+            row["tags"] = [str(x) for x in tags if str(x).strip()]
+        elif "tags" not in row:
+            row["tags"] = []
+
         if ttl_days is not None:
             row["ttl_days"] = int(ttl_days)
+        elif "ttl_days" not in row or not isinstance(row.get("ttl_days"), int):
+            row["ttl_days"] = int(settings.notes_default_ttl_days)
+
         row["updated_at"] = now_iso
+        if "created_at" not in row:
+            row["created_at"] = now_iso
+        if "scope" not in row:
+            row["scope"] = "global"
+
         updated = row
-        event = NoteChangeEvent(
-            id=uuid4().hex,
-            note_id=note_id,
-            kind="note",
-            actor=actor,
-            action="update",
-            timestamp=now_iso,
-            title_before=before.get("title"),
-            title_after=row.get("title"),
-            content_before=before.get("content"),
-            content_after=row.get("content"),
-            tags_before=list(before.get("tags") or []),
-            tags_after=list(row.get("tags") or []),
-        )
+        event = {
+            "id": uuid4().hex,
+            "note_id": note_id,
+            "kind": "note",
+            "actor": str(actor or "user"),
+            "action": "update",
+            "timestamp": now_iso,
+            "title_before": str(before.get("title") or "") or None,
+            "title_after": str(row.get("title") or "") or None,
+            "content_before": str(before.get("content") or ""),
+            "content_after": str(row.get("content") or ""),
+            "tags_before": [str(x) for x in (before.get("tags") or []) if str(x).strip()],
+            "tags_after": [str(x) for x in (row.get("tags") or []) if str(x).strip()],
+        }
         _append_change_event(settings, event)
         break
+
     if updated is None:
         return None
+
     _write_jsonl(_note_path(settings), rows)
     return updated
 
@@ -319,7 +343,6 @@ def build_active_notes_snippet(settings: Settings, session_id: str | None, now: 
         return None
     snippet = "\n".join(lines)
     return _compress_text(snippet, 400)
-
 
 @dataclass
 class LTMTopicIndex:
@@ -575,20 +598,20 @@ def execute_memory_tool(tool_name: str, arguments: dict[str, Any], *, settings: 
         _write_jsonl(_note_path(settings), rows)
         _append_change_event(
             settings,
-            NoteChangeEvent(
-                id=uuid4().hex,
-                note_id=record.id,
-                kind="note",
-                actor="model",
-                action="create",
-                timestamp=record.created_at,
-                title_before=None,
-                title_after=record.title,
-                content_before=None,
-                content_after=record.content,
-                tags_before=None,
-                tags_after=list(record.tags),
-            ),
+            {
+                "id": uuid4().hex,
+                "note_id": record.id,
+                "kind": "note",
+                "actor": "model",
+                "action": "create",
+                "timestamp": record.created_at,
+                "title_before": None,
+                "title_after": record.title,
+                "content_before": "",
+                "content_after": str(record.content or ""),
+                "tags_before": None,
+                "tags_after": list(record.tags),
+            },
         )
         notify_memory_event(settings, "note_created", record, "model")
         logger.info("memory_v2 note_create id=%s scope=%s", record.id, scope)
@@ -663,20 +686,20 @@ def execute_memory_tool(tool_name: str, arguments: dict[str, Any], *, settings: 
             result = asdict(card)
             _append_change_event(
                 settings,
-                NoteChangeEvent(
-                    id=uuid4().hex,
-                    note_id=card.id,
-                    kind="midterm",
-                    actor="model",
-                    action="create",
-                    timestamp=card.created_at,
-                    title_before=None,
-                    title_after=card.topic,
-                    content_before=None,
-                    content_after=card.summary,
-                    tags_before=None,
-                    tags_after=list(card.keywords),
-                ),
+                {
+                    "id": uuid4().hex,
+                    "note_id": card.id,
+                    "kind": "midterm",
+                    "actor": "model",
+                    "action": "create",
+                    "timestamp": card.created_at,
+                    "title_before": None,
+                    "title_after": card.topic,
+                    "content_before": "",
+                    "content_after": str(card.summary or ""),
+                    "tags_before": None,
+                    "tags_after": list(card.keywords),
+                },
             )
         else:
             before = dict(found)
@@ -691,24 +714,24 @@ def execute_memory_tool(tool_name: str, arguments: dict[str, Any], *, settings: 
             result = found
             _append_change_event(
                 settings,
-                NoteChangeEvent(
-                    id=uuid4().hex,
-                    note_id=str(found.get("id") or ""),
-                    kind="midterm",
-                    actor="model",
-                    action="update",
-                    timestamp=str(found.get("updated_at") or _to_iso(now)),
-                    title_before=str(before.get("topic") or "") or None,
-                    title_after=str(found.get("topic") or "") or None,
-                    content_before=(
+                {
+                    "id": uuid4().hex,
+                    "note_id": str(found.get("id") or ""),
+                    "kind": "midterm",
+                    "actor": "model",
+                    "action": "update",
+                    "timestamp": str(found.get("updated_at") or _to_iso(now)),
+                    "title_before": str(before.get("topic") or "") or None,
+                    "title_after": str(found.get("topic") or "") or None,
+                    "content_before": (
                         f"summary: {str(before.get('summary') or '')}\nemotional_undertone: {str(before.get('emotional_undertone') or '')}"
                     ),
-                    content_after=(
+                    "content_after": (
                         f"summary: {str(found.get('summary') or '')}\nemotional_undertone: {str(found.get('emotional_undertone') or '')}"
                     ),
-                    tags_before=list(before.get("keywords") or []),
-                    tags_after=list(found.get("keywords") or []),
-                ),
+                    "tags_before": list(before.get("keywords") or []),
+                    "tags_after": list(found.get("keywords") or []),
+                },
             )
 
         _write_jsonl(_midterm_path(settings), rows)
