@@ -498,12 +498,20 @@ def _ltm_index_path(settings: Settings) -> Path:
     return Path(settings.ltm_index_path)
 
 
-def _is_active(created_at: str | None, ttl_days: int | None, now: datetime) -> bool:
-    created = _parse_iso(created_at)
-    if created is None:
+def _is_active(
+    created_at: str | None,
+    ttl_days: int | None,
+    now: datetime,
+    *,
+    updated_at: str | None = None,
+) -> bool:
+    # TTL is anchored to last update when available, fallback to creation time.
+    # This keeps manually edited notes/cards active for their configured TTL window.
+    anchor = _parse_iso(updated_at) or _parse_iso(created_at)
+    if anchor is None:
         return False
     ttl = ttl_days if isinstance(ttl_days, int) and ttl_days > 0 else 1
-    return created + timedelta(days=ttl) > now
+    return anchor + timedelta(days=ttl) > now
 
 
 def _load_ltm_topics(settings: Settings) -> list[dict[str, Any]]:
@@ -755,7 +763,7 @@ def execute_memory_tool(tool_name: str, arguments: dict[str, Any], *, settings: 
                 continue
             if scope == "session" and row.get("session_id") != shared_session_id:
                 continue
-            if not _is_active(row.get("created_at"), row.get("ttl_days"), now):
+            if not _is_active(row.get("created_at"), row.get("ttl_days"), now, updated_at=row.get("updated_at")):
                 continue
             if topic_contains and topic_contains not in str(row.get("topic") or "").lower():
                 continue
@@ -954,7 +962,7 @@ def build_active_memory_snippet(
     l1_rows = [
         row for row in _read_jsonl(_note_path(settings))
         if str(row.get("scope") or "") == "global"
-        and _is_active(row.get("created_at"), row.get("ttl_days"), now)
+        and _is_active(row.get("created_at"), row.get("ttl_days"), now, updated_at=row.get("updated_at"))
     ]
     l1_rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
 
@@ -963,7 +971,7 @@ def build_active_memory_snippet(
     l2_rows = [
         row for row in _read_jsonl(_midterm_path(settings))
         if str(row.get("scope") or "") == "global"
-        and _is_active(row.get("created_at"), row.get("ttl_days"), now)
+        and _is_active(row.get("created_at"), row.get("ttl_days"), now, updated_at=row.get("updated_at"))
     ]
     l2_rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
     selected_cards = _select_active_midterm_cards(l2_rows)
