@@ -2900,18 +2900,167 @@ async def memory_api_midterms(settings: Settings = Depends(get_settings)) -> Any
 
 @app.get("/memory/console", response_class=HTMLResponse)
 async def memory_console() -> str:
+    # NOTE: keep this as a plain triple-quoted string, not f-string.
     return """
-<!doctype html><html><head><meta charset='utf-8'><title>Memory Console</title>
-<style>body{font-family:sans-serif;margin:0}#app{display:flex;height:100vh}.left{width:32%;border-right:1px solid #ddd;padding:12px;overflow:auto}.right{flex:1;padding:12px;overflow:auto}.item{padding:8px;border:1px solid #ddd;margin-bottom:6px;cursor:pointer}.tabs button{margin-right:6px}textarea{width:100%;min-height:180px}input{width:100%}del{background:#ffe3e3}ins{background:#e3ffe6;text-decoration:none}</style>
-</head><body><div id='app'><div class='left'><div class='tabs'><button onclick='loadNotes()'>L1 Notes</button><button onclick='loadMidterms()'>L2 Midterms</button></div><div id='list'></div></div><div class='right'><div id='detail'>Select an item.</div></div></div>
-<script>
-let currentNoteId=null;
-function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
-function diffLines(a,b){const aa=String(a||'').split('\n');const bb=String(b||'').split('\n');let out='';const max=Math.max(aa.length,bb.length);for(let i=0;i<max;i++){if(aa[i]===bb[i]){if(aa[i]!==undefined)out+=`<div>${esc(aa[i])}</div>`;}else{if(aa[i]!==undefined)out+=`<div><del>${esc(aa[i])}</del></div>`;if(bb[i]!==undefined)out+=`<div><ins>${esc(bb[i])}</ins></div>`;}}return out;}
-async function loadNotes(){const r=await fetch('/memory/api/notes');const j=await r.json();const list=document.getElementById('list');list.innerHTML=(j.notes||[]).map(n=>`<div class='item' onclick="showNote('${n.id}')"><b>${esc(n.title||'(untitled)')}</b><br><small>${esc((n.tags||[]).join(', '))}</small></div>`).join('');}
-async function loadMidterms(){const r=await fetch('/memory/api/midterms');const j=await r.json();const list=document.getElementById('list');list.innerHTML=(j.midterms||[]).map(m=>`<div class='item'><b>${esc(m.topic)}</b><br><small>${esc((m.keywords||[]).join(', '))}</small><p>${esc(m.summary||'')}</p></div>`).join('');document.getElementById('detail').innerHTML='L2 is read-only for now.';}
-async function showNote(id){currentNoteId=id;const r=await fetch('/memory/api/notes/'+id);const j=await r.json();const n=j.note;const detail=document.getElementById('detail');const changes=(j.changes||[]).map(c=>`<div style='border:1px solid #ddd;padding:8px;margin:6px 0'><div><b>${esc(c.actor)}</b> / ${esc(c.action)} / ${esc(c.timestamp)}</div>${diffLines(c.content_before,c.content_after)}</div>`).join('');detail.innerHTML=`<div><label>Title</label><input id='f_title' value="${esc(n.title||'')}"></div><div><label>Tags (comma)</label><input id='f_tags' value="${esc((n.tags||[]).join(','))}"></div><div><label>TTL days</label><input id='f_ttl' type='number' value="${esc(n.ttl_days||7)}"></div><div><label>Content</label><textarea id='f_content'>${esc(n.content||'')}</textarea></div><button onclick='saveNote()'>Save</button><h3>Changes</h3>${changes}`;}
-async function saveNote(){if(!currentNoteId)return;const body={title:document.getElementById('f_title').value,content:document.getElementById('f_content').value,tags:document.getElementById('f_tags').value.split(',').map(s=>s.trim()).filter(Boolean),ttl_days:parseInt(document.getElementById('f_ttl').value||'7',10)};await fetch('/memory/api/notes/'+currentNoteId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});await showNote(currentNoteId);await loadNotes();}
-loadNotes();
-</script></body></html>
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Memory Console</title>
+    <style>
+      body{font-family:sans-serif;margin:0}
+      #app{display:flex;height:100vh}
+      .left{width:32%;border-right:1px solid #ddd;padding:12px;overflow:auto}
+      .right{flex:1;padding:12px;overflow:auto}
+      .item{padding:8px;border:1px solid #ddd;margin-bottom:6px;cursor:pointer}
+      .tabs button{margin-right:6px}
+      textarea{width:100%;min-height:180px}
+      input{width:100%}
+      del{background:#ffe3e3}
+      ins{background:#e3ffe6;text-decoration:none}
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div class="left">
+        <div class="tabs">
+          <button onclick="loadNotes()">L1 Notes</button>
+          <button onclick="loadMidterms()">L2 Midterms</button>
+        </div>
+        <div id="list"></div>
+      </div>
+      <div class="right">
+        <div id="detail">Select an item.</div>
+      </div>
+    </div>
+
+    <script>
+    var currentNoteId = null;
+
+    function esc(s) {
+      if (s === null || s === undefined) {
+        s = "";
+      } else {
+        s = String(s);
+      }
+      s = s.replace(/&/g, "&amp;");
+      s = s.replace(/</g, "&lt;");
+      s = s.replace(/>/g, "&gt;");
+      return s;
+    }
+
+    function diffLines(a, b) {
+      var aa = String(a || "").split("\\n");
+      var bb = String(b || "").split("\\n");
+      var out = "";
+      var max = Math.max(aa.length, bb.length);
+      for (var i = 0; i < max; i++) {
+        if (aa[i] === bb[i]) {
+          if (aa[i] !== undefined) {
+            out += "<div>" + esc(aa[i]) + "</div>";
+          }
+        } else {
+          if (aa[i] !== undefined) {
+            out += "<div><del>" + esc(aa[i]) + "</del></div>";
+          }
+          if (bb[i] !== undefined) {
+            out += "<div><ins>" + esc(bb[i]) + "</ins></div>";
+          }
+        }
+      }
+      return out;
+    }
+
+    function renderNoteItem(n) {
+      var title = esc(n.title || "(untitled)");
+      var tags = esc((n.tags || []).join(", "));
+      var id = esc(n.id || "");
+      return "<div class=\\"item\\" onclick=\\"showNote('" + id + "')\\">"
+             + "<b>" + title + "</b><br>"
+             + "<small>" + tags + "</small>"
+             + "</div>";
+    }
+
+    function renderMidtermItem(m) {
+      var topic = esc(m.topic || "");
+      var keywords = esc((m.keywords || []).join(", "));
+      var summary = esc(m.summary || "");
+      return "<div class=\\"item\\">"
+             + "<b>" + topic + "</b><br>"
+             + "<small>" + keywords + "</small>"
+             + "<p>" + summary + "</p>"
+             + "</div>";
+    }
+
+    async function loadNotes() {
+      var r = await fetch("/memory/api/notes");
+      var j = await r.json();
+      var list = document.getElementById("list");
+      var items = (j.notes || []).map(renderNoteItem).join("");
+      list.innerHTML = items;
+      document.getElementById("detail").innerHTML = "Select a note.";
+    }
+
+    async function loadMidterms() {
+      var r = await fetch("/memory/api/midterms");
+      var j = await r.json();
+      var list = document.getElementById("list");
+      var items = (j.midterms || []).map(renderMidtermItem).join("");
+      list.innerHTML = items;
+      document.getElementById("detail").innerHTML = "L2 is read-only for now.";
+    }
+
+    async function showNote(id) {
+      currentNoteId = id;
+      var r = await fetch("/memory/api/notes/" + id);
+      var j = await r.json();
+      var n = j.note;
+      var changes = (j.changes || []).map(function (c) {
+        return "<div style=\\"border:1px solid #ddd;padding:8px;margin:6px 0\\">"
+               + "<div><b>" + esc(c.actor) + "</b> / "
+               + esc(c.action) + " / "
+               + esc(c.timestamp) + "</div>"
+               + diffLines(c.content_before, c.content_after)
+               + "</div>";
+      }).join("");
+
+      var html = "";
+      html += "<div><label>Title</label>";
+      html += "<input id=\\"f_title\\" value=\\"" + esc(n.title || "") + "\\"></div>";
+      html += "<div><label>Tags (comma)</label>";
+      html += "<input id=\\"f_tags\\" value=\\"" + esc((n.tags || []).join(",")) + "\\"></div>";
+      html += "<div><label>TTL days</label>";
+      html += "<input id=\\"f_ttl\\" type=\\"number\\" value=\\"" + esc(n.ttl_days || 7) + "\\"></div>";
+      html += "<div><label>Content</label>";
+      html += "<textarea id=\\"f_content\\">" + esc(n.content || "") + "</textarea></div>";
+      html += "<button onclick=\\"saveNote()\\">Save</button>";
+      html += "<h3>Changes</h3>" + changes;
+
+      document.getElementById("detail").innerHTML = html;
+    }
+
+    async function saveNote() {
+      if (!currentNoteId) return;
+      var body = {
+        title: document.getElementById("f_title").value,
+        content: document.getElementById("f_content").value,
+        tags: document.getElementById("f_tags").value.split(",").map(function (s) {
+          return s.trim();
+        }).filter(function (s) { return s; }),
+        ttl_days: parseInt(document.getElementById("f_ttl").value || "7", 10)
+      };
+      await fetch("/memory/api/notes/" + currentNoteId, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body)
+      });
+      await showNote(currentNoteId);
+      await loadNotes();
+    }
+
+    // initial load
+    loadNotes();
+    </script>
+  </body>
+</html>
 """
