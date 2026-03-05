@@ -60,9 +60,12 @@ class Settings(BaseSettings):
     default_tz: str = "Asia/Shanghai"
 
     notes_log_path: str = "/data/notes_log.jsonl"
+    notes_change_log_path: str = "/data/notes_changes.jsonl"
     notes_default_ttl_days: int = 7
     midterm_memory_path: str = "/data/midterm_memory.jsonl"
     midterm_default_ttl_days: int = 14
+    memory_event_telegram_chat_id: str | None = None
+    memory_event_enabled: bool = True
 
     ltm_index_path: str = "/data/ltm_index.json"
 
@@ -115,9 +118,12 @@ def get_settings() -> Settings:
         default_tz=os.getenv("DEFAULT_TZ", os.getenv("TIMEZONE", "Asia/Shanghai")),
 
         notes_log_path=os.getenv("NOTES_LOG_PATH", "/data/notes_log.jsonl"),
+        notes_change_log_path=os.getenv("NOTES_CHANGE_LOG_PATH", "/data/notes_changes.jsonl"),
         notes_default_ttl_days=_safe_int(os.getenv("NOTES_DEFAULT_TTL_DAYS"), 7),
         midterm_memory_path=os.getenv("MIDTERM_MEMORY_PATH", "/data/midterm_memory.jsonl"),
         midterm_default_ttl_days=_safe_int(os.getenv("MIDTERM_DEFAULT_TTL_DAYS"), 14),
+        memory_event_telegram_chat_id=os.getenv("MEMORY_EVENT_TELEGRAM_CHAT_ID") or None,
+        memory_event_enabled=_safe_bool(os.getenv("MEMORY_EVENT_ENABLED"), True),
         ltm_index_path=os.getenv("LTM_INDEX_PATH", "/data/ltm_index.json"),
         tasks_log_path=os.getenv("TASKS_LOG_PATH", "/data/tasks.jsonl"),
         task_check_interval_minutes=_safe_int(os.getenv("TASK_CHECK_INTERVAL_MINUTES"), 2),
