@@ -18,7 +18,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from httpx_socks import AsyncProxyTransport
 
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from config import Settings, get_settings
 
@@ -2861,21 +2861,54 @@ async def memory_api_note_detail(note_id: str, settings: Settings = Depends(get_
 @app.post("/memory/api/notes/{note_id}")
 async def memory_api_note_update(
     note_id: str,
-    req: MemoryNoteUpdateRequest,
+    payload: dict[str, Any] = Body(...),
     settings: Settings = Depends(get_settings),
 ) -> Any:
-    updated = update_note_by_id(
-        settings,
-        note_id,
-        actor="user",
-        title=req.title,
-        content=req.content,
-        tags=req.tags,
-        ttl_days=req.ttl_days,
-    )
-    if updated is None:
-        raise HTTPException(status_code=404, detail="note not found")
-    return {"note": updated}
+    try:
+        title_provided = "title" in payload
+        content_provided = "content" in payload
+        tags_provided = "tags" in payload
+        ttl_provided = "ttl_days" in payload
+
+        title = str(payload.get("title") or "") if title_provided else None
+        content = str(payload.get("content") or "") if content_provided else None
+
+        tags: list[str] | None = None
+        if tags_provided:
+            raw_tags = payload.get("tags")
+            if isinstance(raw_tags, list):
+                tags = [str(x).strip() for x in raw_tags if str(x).strip()]
+            else:
+                tags = []
+
+        ttl_days: int | None = None
+        if ttl_provided:
+            raw_ttl = payload.get("ttl_days")
+            if raw_ttl is None or (isinstance(raw_ttl, str) and not raw_ttl.strip()):
+                ttl_days = None
+            else:
+                try:
+                    ttl_days = int(raw_ttl)
+                except (TypeError, ValueError):
+                    return JSONResponse(status_code=400, content={"ok": False, "error": "ttl_days must be an integer when provided"})
+
+        updated = update_note_by_id(
+            settings,
+            note_id,
+            actor="user",
+            title=title,
+            content=content,
+            tags=tags,
+            ttl_days=ttl_days,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="note not found")
+        return {"note": updated}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("memory_api_note_update failed note_id=%s err=%r", note_id, exc)
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
 
 
 @app.get("/memory/api/midterms")
