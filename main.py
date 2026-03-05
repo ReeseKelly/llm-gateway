@@ -15,9 +15,10 @@ if logger.level == logging.NOTSET:
 
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 from httpx_socks import AsyncProxyTransport
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from config import Settings, get_settings
 
@@ -35,7 +36,17 @@ from memories import (
 )
 
 
-from memory_v2 import MEMORY_TOOLS, build_active_memory_snippet, execute_memory_tool
+from memory_v2 import (
+    MEMORY_TOOLS,
+    build_active_memory_snippet,
+    build_active_notes_snippet,
+    execute_memory_tool,
+    get_active_midterms,
+    get_active_notes,
+    get_note_by_id,
+    get_note_changes,
+    update_note_by_id,
+)
 from task_engine import TASK_TOOLS, execute_task_tool
 from telemetry_tools import TELEMETRY_TOOLS, execute_telemetry_tool
 
@@ -2356,6 +2367,7 @@ async def chat_completions(request: Request) -> Any:
         settings=settings,
         summary_session_id=summary_session_id,
     )
+    active_notes_snippet = build_active_notes_snippet(settings, history_session_id, datetime.now(timezone.utc))
     if active_snippet:
         system_messages.append({"role": "system", "content": active_snippet})
         logger.debug(
@@ -2366,6 +2378,8 @@ async def chat_completions(request: Request) -> Any:
             int(snippet_meta.get("l2_counts", 0)),
             snippet_meta.get("l2_selected_topics", []),
         )
+    if active_notes_snippet:
+        system_messages.append({"role": "system", "content": active_notes_snippet})
 
     print("DEBUG system_messages before context budget:")
     for msg in system_messages:
@@ -2805,3 +2819,99 @@ async def debug_session_summary(logical_session_id: str) -> Any:
         "summary": summary,
     }
 
+class MemoryNoteUpdateRequest(BaseModel):
+    title: str | None = None
+    content: str | None = None
+    tags: list[str] | None = None
+    ttl_days: int | None = None
+
+
+@app.get("/memory/api/notes")
+async def memory_api_notes(
+    scope: str = "default",
+    settings: Settings = Depends(get_settings),
+) -> Any:
+    notes = get_active_notes(settings, settings.shared_session_id, scope=scope)
+    return {
+        "notes": [
+            {
+                "id": n.get("id"),
+                "title": n.get("title"),
+                "tags": n.get("tags") or [],
+                "scope": n.get("scope"),
+                "session_id": n.get("session_id"),
+                "created_at": n.get("created_at"),
+                "updated_at": n.get("updated_at"),
+                "ttl_days": n.get("ttl_days"),
+            }
+            for n in notes
+        ]
+    }
+
+
+@app.get("/memory/api/notes/{note_id}")
+async def memory_api_note_detail(note_id: str, settings: Settings = Depends(get_settings)) -> Any:
+    note = get_note_by_id(settings, note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    changes = get_note_changes(settings, note_id)
+    return {"note": note, "changes": changes}
+
+
+@app.post("/memory/api/notes/{note_id}")
+async def memory_api_note_update(
+    note_id: str,
+    req: MemoryNoteUpdateRequest,
+    settings: Settings = Depends(get_settings),
+) -> Any:
+    updated = update_note_by_id(
+        settings,
+        note_id,
+        actor="user",
+        title=req.title,
+        content=req.content,
+        tags=req.tags,
+        ttl_days=req.ttl_days,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return {"note": updated}
+
+
+@app.get("/memory/api/midterms")
+async def memory_api_midterms(settings: Settings = Depends(get_settings)) -> Any:
+    mids = get_active_midterms(settings, settings.shared_session_id)
+    return {
+        "midterms": [
+            {
+                "id": m.get("id"),
+                "topic": m.get("topic"),
+                "summary": m.get("summary"),
+                "emotional_undertone": m.get("emotional_undertone"),
+                "keywords": m.get("keywords") or [],
+                "scope": m.get("scope"),
+                "created_at": m.get("created_at"),
+                "updated_at": m.get("updated_at"),
+            }
+            for m in mids
+        ]
+    }
+
+
+@app.get("/memory/console", response_class=HTMLResponse)
+async def memory_console() -> str:
+    return """
+<!doctype html><html><head><meta charset='utf-8'><title>Memory Console</title>
+<style>body{font-family:sans-serif;margin:0}#app{display:flex;height:100vh}.left{width:32%;border-right:1px solid #ddd;padding:12px;overflow:auto}.right{flex:1;padding:12px;overflow:auto}.item{padding:8px;border:1px solid #ddd;margin-bottom:6px;cursor:pointer}.tabs button{margin-right:6px}textarea{width:100%;min-height:180px}input{width:100%}del{background:#ffe3e3}ins{background:#e3ffe6;text-decoration:none}</style>
+</head><body><div id='app'><div class='left'><div class='tabs'><button onclick='loadNotes()'>L1 Notes</button><button onclick='loadMidterms()'>L2 Midterms</button></div><div id='list'></div></div><div class='right'><div id='detail'>Select an item.</div></div></div>
+<script>
+let currentNoteId=null;
+function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
+function diffLines(a,b){const aa=String(a||'').split('\n');const bb=String(b||'').split('\n');let out='';const max=Math.max(aa.length,bb.length);for(let i=0;i<max;i++){if(aa[i]===bb[i]){if(aa[i]!==undefined)out+=`<div>${esc(aa[i])}</div>`;}else{if(aa[i]!==undefined)out+=`<div><del>${esc(aa[i])}</del></div>`;if(bb[i]!==undefined)out+=`<div><ins>${esc(bb[i])}</ins></div>`;}}return out;}
+async function loadNotes(){const r=await fetch('/memory/api/notes');const j=await r.json();const list=document.getElementById('list');list.innerHTML=(j.notes||[]).map(n=>`<div class='item' onclick="showNote('${n.id}')"><b>${esc(n.title||'(untitled)')}</b><br><small>${esc((n.tags||[]).join(', '))}</small></div>`).join('');}
+async function loadMidterms(){const r=await fetch('/memory/api/midterms');const j=await r.json();const list=document.getElementById('list');list.innerHTML=(j.midterms||[]).map(m=>`<div class='item'><b>${esc(m.topic)}</b><br><small>${esc((m.keywords||[]).join(', '))}</small><p>${esc(m.summary||'')}</p></div>`).join('');document.getElementById('detail').innerHTML='L2 is read-only for now.';}
+async function showNote(id){currentNoteId=id;const r=await fetch('/memory/api/notes/'+id);const j=await r.json();const n=j.note;const detail=document.getElementById('detail');const changes=(j.changes||[]).map(c=>`<div style='border:1px solid #ddd;padding:8px;margin:6px 0'><div><b>${esc(c.actor)}</b> / ${esc(c.action)} / ${esc(c.timestamp)}</div>${diffLines(c.content_before,c.content_after)}</div>`).join('');detail.innerHTML=`<div><label>Title</label><input id='f_title' value="${esc(n.title||'')}"></div><div><label>Tags (comma)</label><input id='f_tags' value="${esc((n.tags||[]).join(','))}"></div><div><label>TTL days</label><input id='f_ttl' type='number' value="${esc(n.ttl_days||7)}"></div><div><label>Content</label><textarea id='f_content'>${esc(n.content||'')}</textarea></div><button onclick='saveNote()'>Save</button><h3>Changes</h3>${changes}`;}
+async function saveNote(){if(!currentNoteId)return;const body={title:document.getElementById('f_title').value,content:document.getElementById('f_content').value,tags:document.getElementById('f_tags').value.split(',').map(s=>s.trim()).filter(Boolean),ttl_days:parseInt(document.getElementById('f_ttl').value||'7',10)};await fetch('/memory/api/notes/'+currentNoteId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});await showNote(currentNoteId);await loadNotes();}
+loadNotes();
+</script></body></html>
+"""
