@@ -68,6 +68,13 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            
+def _normalize_tags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(",") if x.strip()]
+    return []
 
 
 @dataclass
@@ -98,14 +105,14 @@ class NoteRecord:
             ttl_days = None
         return cls(
             id=str(row.get("id") or uuid4().hex),
-            session_id=(str(row.get("session_id")) if row.get("session_id") is not None else None),
-            scope=str(row.get("scope") or "global"),
+            session_id=(str(row.get("session_id")).strip() if row.get("session_id") is not None and str(row.get("session_id")).strip() else None),
+            scope=(str(row.get("scope") or "global").strip() or "global"),
             title=str(row.get("title") or ""),
             content=str(row.get("content") or ""),
             created_at=str(row.get("created_at") or now_iso),
             updated_at=str(row.get("updated_at")) if row.get("updated_at") else None,
             ttl_days=ttl_days,
-            tags=[str(x) for x in (row.get("tags") or []) if str(x).strip()],
+            tags=_normalize_tags(row.get("tags")),
         )
 
     def touch(self) -> None:
@@ -119,6 +126,7 @@ class NoteRecord:
             return False
         check_now = now or _utc_now()
         return base + timedelta(days=self.ttl_days) < check_now
+
 
 
 @dataclass
