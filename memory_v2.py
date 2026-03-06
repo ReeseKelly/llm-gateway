@@ -78,9 +78,47 @@ class NoteRecord:
     title: str
     content: str
     created_at: str
-    updated_at: str
-    ttl_days: int
+    updated_at: str | None
+    ttl_days: int | None
     tags: list[str] = field(default_factory=list)
+
+ @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "NoteRecord":
+        now_iso = _to_iso(_utc_now())
+        ttl_raw = row.get("ttl_days")
+        ttl_days: int | None
+        if isinstance(ttl_raw, int):
+            ttl_days = ttl_raw
+        elif isinstance(ttl_raw, str) and ttl_raw.strip():
+            try:
+                ttl_days = int(ttl_raw)
+            except ValueError:
+                ttl_days = None
+        else:
+            ttl_days = None
+        return cls(
+            id=str(row.get("id") or uuid4().hex),
+            session_id=(str(row.get("session_id")) if row.get("session_id") is not None else None),
+            scope=str(row.get("scope") or "global"),
+            title=str(row.get("title") or ""),
+            content=str(row.get("content") or ""),
+            created_at=str(row.get("created_at") or now_iso),
+            updated_at=str(row.get("updated_at")) if row.get("updated_at") else None,
+            ttl_days=ttl_days,
+            tags=[str(x) for x in (row.get("tags") or []) if str(x).strip()],
+        )
+
+    def touch(self) -> None:
+        self.updated_at = _to_iso(_utc_now())
+
+    def is_expired(self, now: datetime | None = None) -> bool:
+        base = _parse_iso(self.updated_at) or _parse_iso(self.created_at)
+        if base is None:
+            return False
+        if self.ttl_days is None or self.ttl_days <= 0:
+            return False
+        check_now = now or _utc_now()
+        return base + timedelta(days=self.ttl_days) < check_now
 
 
 @dataclass
@@ -97,6 +135,7 @@ class MidtermCard:
     scope: str
     promoted_to_ltm: bool
     last_used_at: str | None = None
+
 
 @dataclass
 class NoteChangeEvent:
@@ -171,36 +210,57 @@ def notify_memory_event(settings: Settings, kind: str, record: NoteRecord | Midt
     send_debug_message(text=text, chat_id=settings.memory_event_telegram_chat_id)
 
 
-def get_active_notes(settings: Settings, shared_session_id: str | None, scope: str = "default") -> list[dict[str, Any]]:
+def list_notes(
+    settings: Settings,
+    shared_session_id: str | None,
+    *,
+    scope: str = "default",
+    include_expired: bool = False,
+) -> list[NoteRecord]:
     now = _utc_now()
     rows = _read_jsonl(_note_path(settings))
-    out: list[dict[str, Any]] = []
+    out: list[NoteRecord] = []
     for row in rows:
-        row_scope = str(row.get("scope") or "")
-        if not _is_active(row.get("created_at"), row.get("ttl_days"), now):
+        note = NoteRecord.from_row(row)
+        if not include_expired and note.is_expired(now):
             continue
-        if scope == "global" and row_scope != "global":
+        if scope == "global" and note.scope != "global":
             continue
-        if scope == "session" and row_scope != "session":
+        if scope == "session" and note.scope != "session":
             continue
         if scope == "default":
-            if row_scope == "session" and row.get("session_id") != shared_session_id:
+            if note.scope == "session" and note.session_id != shared_session_id:
                 continue
-            if row_scope not in {"global", "session"}:
+            if note.scope not in {"global", "session"}:
                 continue
         elif scope == "all":
-            if row_scope == "session" and row.get("session_id") != shared_session_id:
+            if note.scope == "session" and note.session_id != shared_session_id:
                 continue
         elif scope not in {"global", "session"}:
-            if row_scope == "session" and row.get("session_id") != shared_session_id:
+            if note.scope == "session" and note.session_id != shared_session_id:
                 continue
-            if row_scope not in {"global", "session"}:
+            if note.scope not in {"global", "session"}:
                 continue
-        if row_scope == "session" and row.get("session_id") != shared_session_id:
+        if note.scope == "session" and note.session_id != shared_session_id:
             continue
-        out.append(row)
-    out.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+        out.append(note)
+    out.sort(key=lambda item: str(item.updated_at or item.created_at or ""), reverse=True)
     return out
+
+
+def get_active_notes(
+    settings: Settings,
+    shared_session_id: str | None,
+    scope: str = "default",
+    include_expired: bool = False,
+) -> list[dict[str, Any]]:
+    notes = list_notes(
+        settings,
+        shared_session_id,
+        scope=scope,
+        include_expired=include_expired,
+    )
+    return [asdict(note) for note in notes]
 
 
 def get_note_by_id(settings: Settings, note_id: str) -> dict[str, Any] | None:
@@ -221,64 +281,66 @@ def update_note_by_id(
     ttl_days: int | None = None,
 ) -> dict[str, Any] | None:
     rows = _read_jsonl(_note_path(settings))
-    now_iso = _to_iso(_utc_now())
-    updated: dict[str, Any] | None = None
+    updated: NoteRecord | None = None
 
-    for row in rows:
+    for idx, row in enumerate(rows):
         if str(row.get("id") or "") != note_id:
             continue
 
-        before = dict(row)
+        note = NoteRecord.from_row(row)
+        before = NoteRecord.from_row(row)
+        changed = False
 
-        if title is not None:
-            row["title"] = str(title)
-        elif "title" not in row:
-            row["title"] = ""
+        if title is not None and str(title) != note.title:
+            note.title = str(title)
+            changed = True
 
-        if content is not None:
-            row["content"] = str(content)
-        elif "content" not in row:
-            row["content"] = ""
+        if content is not None and str(content) != note.content:
+            note.content = str(content)
+            changed = True
 
         if tags is not None:
-            row["tags"] = [str(x) for x in tags if str(x).strip()]
-        elif "tags" not in row:
-            row["tags"] = []
+            norm_tags = [str(x).strip() for x in tags if str(x).strip()]
+            if norm_tags != note.tags:
+                note.tags = norm_tags
+                changed = True
 
-        if ttl_days is not None:
-            row["ttl_days"] = int(ttl_days)
-        elif "ttl_days" not in row or not isinstance(row.get("ttl_days"), int):
-            row["ttl_days"] = int(settings.notes_default_ttl_days)
+        if ttl_days is not None and int(ttl_days) != (note.ttl_days if note.ttl_days is not None else None):
+            note.ttl_days = int(ttl_days)
+            changed = True
 
-        row["updated_at"] = now_iso
-        if "created_at" not in row:
-            row["created_at"] = now_iso
-        if "scope" not in row:
-            row["scope"] = "global"
+        if note.ttl_days is None and not isinstance(row.get("ttl_days"), int):
+            note.ttl_days = int(settings.notes_default_ttl_days)
 
-        updated = row
-        event = {
-            "id": uuid4().hex,
-            "note_id": note_id,
-            "kind": "note",
-            "actor": str(actor or "user"),
-            "action": "update",
-            "timestamp": now_iso,
-            "title_before": str(before.get("title") or "") or None,
-            "title_after": str(row.get("title") or "") or None,
-            "content_before": str(before.get("content") or ""),
-            "content_after": str(row.get("content") or ""),
-            "tags_before": [str(x) for x in (before.get("tags") or []) if str(x).strip()],
-            "tags_after": [str(x) for x in (row.get("tags") or []) if str(x).strip()],
-        }
-        _append_change_event(settings, event)
+        if changed:
+            note.touch()
+
+        rows[idx] = asdict(note)
+        updated = note
+
+        if changed:
+            event = {
+                "id": uuid4().hex,
+                "note_id": note_id,
+                "kind": "note",
+                "actor": str(actor or "user"),
+                "action": "update",
+                "timestamp": str(note.updated_at or note.created_at),
+                "title_before": before.title or None,
+                "title_after": note.title or None,
+                "content_before": str(before.content or ""),
+                "content_after": str(note.content or ""),
+                "tags_before": list(before.tags),
+                "tags_after": list(note.tags),
+            }
+            _append_change_event(settings, event)
         break
 
     if updated is None:
         return None
 
     _write_jsonl(_note_path(settings), rows)
-    return updated
+    return asdict(updated)
 
 
 def get_active_midterms(settings: Settings, shared_session_id: str | None) -> list[dict[str, Any]]:
@@ -291,7 +353,7 @@ def get_active_midterms(settings: Settings, shared_session_id: str | None) -> li
             continue
         if scope == "session" and row.get("session_id") != shared_session_id:
             continue
-        if not _is_active(row.get("created_at"), row.get("ttl_days"), now):
+        if not _is_active(row.get("created_at"), row.get("ttl_days"), now, updated_at=row.get("updated_at")):
             continue
         out.append(row)
     out.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
@@ -510,8 +572,9 @@ def _is_active(
     anchor = _parse_iso(updated_at) or _parse_iso(created_at)
     if anchor is None:
         return False
-    ttl = ttl_days if isinstance(ttl_days, int) and ttl_days > 0 else 1
-    return anchor + timedelta(days=ttl) > now
+    if ttl_days is None or not isinstance(ttl_days, int) or ttl_days <= 0:
+        return True
+    return anchor + timedelta(days=ttl_days) > now
 
 
 def _load_ltm_topics(settings: Settings) -> list[dict[str, Any]]:
@@ -631,18 +694,19 @@ def execute_memory_tool(tool_name: str, arguments: dict[str, Any], *, settings: 
         tag_filter = str(arguments.get("tag") or "").strip().lower()
         notes: list[dict[str, Any]] = []
         for row in rows:
-            scope = str(row.get("scope") or "")
+            note = NoteRecord.from_row(row)
+            scope = note.scope
             if scope_filter in {"session", "global"} and scope != scope_filter:
                 continue
-            if not _is_active(row.get("created_at"), row.get("ttl_days"), now):
+            if note.is_expired(now):
                 continue
-            if scope == "session" and row.get("session_id") != shared_session_id:
+            if scope == "session" and note.session_id != shared_session_id:
                 continue
             if tag_filter:
-                tags = [str(t).lower() for t in (row.get("tags") or [])]
+                tags = [str(t).lower() for t in note.tags]
                 if tag_filter not in tags:
                     continue
-            notes.append(row)
+            notes.append(asdict(note))
         notes.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
         return {"ok": True, "count": len(notes), "notes": notes}
 
@@ -960,9 +1024,12 @@ def build_active_memory_snippet(
     now = _utc_now()
 
     l1_rows = [
-        row for row in _read_jsonl(_note_path(settings))
-        if str(row.get("scope") or "") == "global"
-        and _is_active(row.get("created_at"), row.get("ttl_days"), now, updated_at=row.get("updated_at"))
+        asdict(note) for note in list_notes(
+            settings,
+            shared_session_id=summary_session_id,
+            scope="global",
+            include_expired=False,
+        )
     ]
     l1_rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
 
