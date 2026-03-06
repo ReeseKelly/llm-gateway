@@ -38,6 +38,7 @@ from memories import (
 
 from memory_v2 import (
     MEMORY_TOOLS,
+    NoteRecord,
     build_active_memory_snippet,
     build_active_notes_snippet,
     execute_memory_tool,
