@@ -3107,6 +3107,12 @@ async def memory_console() -> str:
 
     async function loadNotes() {
       var r = await fetch("/memory/api/notes?include_expired=true");
+      if (!r.ok) {
+        var errText = await r.text();
+        document.getElementById("list").innerHTML = "";
+        document.getElementById("detail").innerHTML = "Load notes failed: " + esc(errText || r.status);
+        return;
+      }
       var j = await r.json();
       var list = document.getElementById("list");
       var items = (j.notes || []).map(renderNoteItem).join("");
