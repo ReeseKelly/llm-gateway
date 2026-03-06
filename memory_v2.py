@@ -82,7 +82,7 @@ class NoteRecord:
     ttl_days: int | None
     tags: list[str] = field(default_factory=list)
 
- @classmethod
+    @classmethod
     def from_row(cls, row: dict[str, Any]) -> "NoteRecord":
         now_iso = _to_iso(_utc_now())
         ttl_raw = row.get("ttl_days")
